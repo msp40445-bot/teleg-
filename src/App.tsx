@@ -1025,23 +1025,28 @@ function App() {
   }, [telegram, telegramChannelId])
 
   // === LIVE TRADING HANDLERS ===
+  const liveRawRef = useRef('')
   const startLiveTrading = useCallback(() => {
     if (telegram.authStep !== 'connected' || liveRunning) return
     setLiveRunning(true)
+    liveRawRef.current = ''
     const poll = async () => {
       const ch = await telegram.fetchChannelMessages(telegramChannelId, 50)
       if (ch) {
-        setLiveRawText(prev => {
-          const combined = prev ? prev + '\n' + ch : ch
+        // Deduplicate: only add genuinely new content
+        const newLines = ch.split('\n').filter(line => !liveRawRef.current.includes(line))
+        if (newLines.length > 0) {
+          liveRawRef.current = liveRawRef.current ? liveRawRef.current + '\n' + newLines.join('\n') : newLines.join('\n')
+          const combined = liveRawRef.current
           const msgs = parseMessages(combined)
           const sigs = extractSignals(msgs)
           const mapped = mapContextMessages(msgs, sigs)
           const results = generateBacktestResults(mapped)
+          setLiveRawText(combined)
           setLiveMessages(msgs)
           setLiveSignals(mapped)
           setLiveResults(results)
-          return combined
-        })
+        }
       }
     }
     poll()
@@ -1691,7 +1696,15 @@ function App() {
                     <Play size={10} />Start Live
                   </button>
                 )}
-                <span className="text-[9px] text-gray-500">{liveMessages.length} msgs | {liveSignals.length} signals</span>
+                <div className="flex items-center gap-2 text-[9px]">
+                  <span className="text-gray-500">{liveMessages.length} msgs</span>
+                  <span className="text-yellow-400">{liveSignals.length} sigs</span>
+                  <span className="text-green-400">W:{liveResults.filter(r => r.result === 'WIN').length}</span>
+                  <span className="text-red-400">L:{liveResults.filter(r => r.result === 'LOSS').length}</span>
+                  {liveResults.length > 0 && <span className={`font-bold ${liveResults.reduce((s, r) => s + r.pips, 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {liveResults.reduce((s, r) => s + r.pips, 0)}p
+                  </span>}
+                </div>
               </div>
             </div>
           </div>
@@ -1699,30 +1712,39 @@ function App() {
           <div className="flex-1 grid grid-cols-12 gap-1 min-h-0 overflow-hidden">
             {/* Live Signal Feed */}
             <div className="col-span-4 bg-[#0d1321] rounded border border-gray-800/30 flex flex-col min-h-0">
-              <div className="px-2 py-1 border-b border-gray-800/50 flex-shrink-0">
-                <span className="text-[10px] font-bold text-gray-300 flex items-center gap-1"><Zap size={10} className="text-yellow-400" />Active Signals</span>
+              <div className="px-2 py-1 border-b border-gray-800/50 flex-shrink-0 flex items-center justify-between">
+                <span className="text-[10px] font-bold text-gray-300 flex items-center gap-1"><Zap size={10} className="text-yellow-400" />Signals ({liveSignals.length})</span>
+                {liveSignals.length > 0 && <span className="text-[8px] text-gray-600">Latest: {liveSignals[liveSignals.length - 1]?.timestamp.toLocaleString()}</span>}
               </div>
               <div className="flex-1 overflow-y-auto p-1 space-y-0.5 min-h-0">
-                {liveSignals.slice().reverse().map((sig, i) => {
+                {liveSignals.slice().reverse().map(sig => {
                   const r = liveResults.find(lr => lr.signalId === sig.id)
+                  const runnerStatus = sig.tpHits.length > 0 ? (sig.tpHits.length >= 2 ? 'CLOSED' : 'RUNNER') : (sig.status === 'SL_HIT' ? 'SL' : sig.status === 'ACTIVE' ? 'ACTIVE' : 'OPEN')
                   return (
-                    <div key={sig.id} className="bg-gray-900/30 rounded p-1.5 border border-gray-800/30">
+                    <div key={sig.id} className={`bg-gray-900/30 rounded p-1.5 border-l-2 ${r?.result === 'WIN' ? 'border-l-green-500' : r?.result === 'LOSS' ? 'border-l-red-500' : sig.status === 'ACTIVE' ? 'border-l-blue-500' : 'border-l-gray-700'}`}>
                       <div className="flex items-center justify-between mb-0.5">
                         <div className="flex items-center gap-1">
                           {sig.direction === 'BUY' ? <ArrowUpRight size={10} className="text-green-400" /> : <ArrowDownRight size={10} className="text-red-400" />}
                           <span className={`font-bold text-[10px] ${sig.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>{sig.direction}</span>
-                          <span className="text-gray-500 font-mono text-[9px]">{sig.entryLow}-{sig.entryHigh}</span>
+                          <span className="text-gray-500 font-mono text-[8px]">{sig.entryLow}-{sig.entryHigh}</span>
                         </div>
-                        <StatusBadge status={sig.status} />
+                        <div className="flex items-center gap-1">
+                          <span className={`px-1 rounded text-[7px] ${runnerStatus === 'RUNNER' ? 'bg-yellow-500/10 text-yellow-400' : runnerStatus === 'ACTIVE' ? 'bg-blue-500/10 text-blue-400' : runnerStatus === 'SL' ? 'bg-red-500/10 text-red-400' : runnerStatus === 'CLOSED' ? 'bg-gray-500/10 text-gray-500' : 'bg-cyan-500/10 text-cyan-400'}`}>{runnerStatus}</span>
+                          {r && <span className={`font-mono font-bold text-[9px] ${r.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>{r.pips > 0 ? '+' : ''}{r.pips}p</span>}
+                        </div>
                       </div>
-                      <div className="flex items-center gap-2 text-[8px]">
-                        <span className="text-red-400/70">SL:{sig.stopLoss}</span>
+                      <div className="flex items-center gap-1 text-[7px] text-gray-600">
+                        <span className="text-red-400/60">SL:{sig.stopLoss}</span>
                         {sig.takeProfits.map((tp, j) => (
-                          <span key={j} className={sig.tpHits.includes(j + 1) ? 'text-green-400' : 'text-gray-600'}>TP{j + 1}:{tp}</span>
+                          <span key={j} className={sig.tpHits.includes(j + 1) ? 'text-green-400' : ''}>TP{j + 1}:{tp}{sig.tpHits.includes(j + 1) ? '\u2713' : ''}</span>
                         ))}
-                        {r && <span className={`font-bold ${r.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>{r.pips > 0 ? '+' : ''}{r.pips}p</span>}
+                        <span className="ml-auto">{sig.timestamp.toLocaleTimeString()}</span>
                       </div>
-                      <div className="text-[7px] text-gray-600 mt-0.5">{sig.timestamp.toLocaleString()}</div>
+                      {sig.contextMessages && sig.contextMessages.length > 0 && (
+                        <div className="text-[7px] text-gray-700 mt-0.5 flex items-center gap-1">
+                          <Link2 size={7} />{sig.contextMessages.length} linked msgs | {sig.messages.length} updates
+                        </div>
+                      )}
                     </div>
                   )
                 })}
