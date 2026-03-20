@@ -60,7 +60,7 @@ type AppTab = 'dashboard' | 'backtest' | 'live' | 'ai'
 const API_ID = parseInt(import.meta.env.VITE_TELEGRAM_API_ID || '25535062')
 const API_HASH = import.meta.env.VITE_TELEGRAM_API_HASH || '2fcff9d64e970d8fc14ddc256f02c06b'
 const CHANNEL_ID = import.meta.env.VITE_TELEGRAM_CHANNEL_ID || '-1001235475731'
-const DEFAULT_OPENROUTER_KEY = import.meta.env.VITE_OPENROUTER_API_KEY || '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'
+const DEFAULT_OPENROUTER_KEY = import.meta.env.VITE_OPENROUTER_API_KEY || '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'
 const LOT_SIZE = 1
 
 // =============================================
@@ -156,7 +156,6 @@ function generateBacktestResults(signals: Signal[]): BacktestResult[] {
     const lastMsg = signal.messages[signal.messages.length - 1]
     const firstMsg = signal.messages[0]
     const exitTime = lastMsg ? lastMsg.timestamp.toISOString() : entryTime
-    // TradingView verification URL with signal date/time
     const tvDate = signal.timestamp.toISOString().split('T')[0].replace(/-/g, '')
     const verificationUrl = `https://www.tradingview.com/chart/?symbol=OANDA:XAUUSD&interval=15&date=${tvDate}`
     if (!entry || isNaN(entry)) {
@@ -169,23 +168,40 @@ function generateBacktestResults(signals: Signal[]): BacktestResult[] {
     const isWin = signal.status === 'COMPLETED' || signal.status === 'TP_HIT'
     const isLoss = signal.status === 'SL_HIT'
     let exitPrice = entry, pips = 0
-    if (isWin && signal.tpHits.length > 0) {
-      const maxTp = Math.max(...signal.tpHits)
-      exitPrice = signal.takeProfits[maxTp - 1] || signal.takeProfits[signal.takeProfits.length - 1]
-      if (exitPrice && !isNaN(exitPrice)) {
-        pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
-      }
-    } else if (isLoss) {
-      exitPrice = signal.stopLoss
-      if (exitPrice && !isNaN(exitPrice)) {
-        pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
-      }
-    } else if (signal.maxPips && !isNaN(signal.maxPips)) {
+
+    // First priority: use maxPips from actual "Running profit" / "Pips" messages
+    if (signal.maxPips && !isNaN(signal.maxPips) && signal.maxPips > 0) {
       pips = signal.maxPips
       exitPrice = signal.direction === 'BUY' ? entry + pips / 10 : entry - pips / 10
     }
+    // Second priority: TP hit prices
+    else if (isWin && signal.tpHits.length > 0 && signal.takeProfits.length > 0) {
+      const maxTp = Math.max(...signal.tpHits)
+      const tpPrice = signal.takeProfits[maxTp - 1] || signal.takeProfits[signal.takeProfits.length - 1]
+      if (tpPrice && !isNaN(tpPrice) && tpPrice !== 0) {
+        exitPrice = tpPrice
+        pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
+      }
+    }
+    // Third: SL hit
+    else if (isLoss && signal.stopLoss && !isNaN(signal.stopLoss) && signal.stopLoss !== 0) {
+      exitPrice = signal.stopLoss
+      pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
+    }
+    // Fallback for WIN/COMPLETED with no pip data: estimate from TP levels
+    else if (isWin && signal.takeProfits.length > 0) {
+      const firstTp = signal.takeProfits[0]
+      if (firstTp && !isNaN(firstTp) && firstTp !== 0) {
+        exitPrice = firstTp
+        pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
+      }
+    }
+
     if (isNaN(pips)) pips = 0
     if (isNaN(exitPrice)) exitPrice = entry
+    // Ensure pips sign matches result
+    if (isWin && pips < 0) pips = Math.abs(pips)
+    if (isLoss && pips > 0) pips = -Math.abs(pips)
     const pnlUsd = pips * LOT_SIZE * 10
     const duration = lastMsg && firstMsg ? (lastMsg.timestamp.getTime() - firstMsg.timestamp.getTime()) / 60000 : 0
     return {
@@ -209,7 +225,7 @@ async function analyzeSignalWithAI(
   backtestResult: BacktestResult,
   apiKey: string
 ): Promise<{ analysis: string; sentiment: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; confidence: number; keyPoints: string[] }> {
-  const messageTexts = contextMessages.map(m =>
+  const messageTexts = contextMessages.slice(0, 20).map(m =>
     `[${m.timestamp.toLocaleString()}] [${m.type}] ${m.text}`
   ).join('\n')
 
@@ -217,34 +233,76 @@ async function analyzeSignalWithAI(
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'meta-llama/llama-3.1-8b-instruct:free',
+      model: 'openrouter/quasar-alpha',
       messages: [
         {
           role: 'system',
-          content: 'You are a gold trading signal analyst. Analyze messages around a trading signal to understand decision-making patterns. Respond in this exact JSON format only, no other text:\n{"sentiment":"BULLISH or BEARISH or NEUTRAL","confidence":0-100,"keyPoints":["point1","point2","point3"],"analysis":"Brief 2-3 sentence summary"}'
+          content: `You are a professional gold (XAUUSD) trading analyst. Analyze trading signals and their surrounding context messages to evaluate signal quality, decision-making patterns, and risk management.
+
+Your response MUST follow this exact format (keep each section short and direct):
+
+SENTIMENT: BULLISH or BEARISH or NEUTRAL
+CONFIDENCE: a number from 0 to 100
+ANALYSIS: 2-3 sentences summarizing signal quality and trader decision-making
+KEY POINTS:
+- first key observation
+- second key observation  
+- third key observation
+RISK ASSESSMENT: Brief risk evaluation
+RECOMMENDATION: What could be improved`
         },
         {
           role: 'user',
-          content: `Signal ${signal.id}: ${signal.direction} XAUUSD ${signal.entryLow}-${signal.entryHigh}\nTPs: ${signal.takeProfits.join(', ')} | SL: ${signal.stopLoss}\nResult: ${backtestResult.result} (${backtestResult.pips} pips, $${backtestResult.pnlUsd})\nContext messages (${contextMessages.length} total between this signal and adjacent signals):\n${messageTexts}\nAnalyze the decision-making pattern, message timing, and signal quality.`
+          content: `Analyze this gold trading signal:
+
+Signal: ${signal.direction} XAUUSD @ ${signal.entryLow}-${signal.entryHigh}
+Date: ${signal.timestamp.toLocaleString()}
+Take Profits: ${signal.takeProfits.length > 0 ? signal.takeProfits.join(', ') : 'None set'}
+Stop Loss: ${signal.stopLoss || 'None set'}
+TP Hits: ${signal.tpHits.length > 0 ? signal.tpHits.join(', ') : 'None'}
+Status: ${signal.status}
+Result: ${backtestResult.result} (${backtestResult.pips} pips, $${backtestResult.pnlUsd})
+Duration: ${backtestResult.duration} minutes
+
+Context messages (${contextMessages.length} messages around this signal):
+${messageTexts || 'No context messages available'}
+
+Evaluate the signal quality, entry timing, risk-reward ratio, and trader behavior patterns.`
         }
       ],
-      max_tokens: 400
+      max_tokens: 500
     })
   })
   const data = await response.json()
   const content = data.choices?.[0]?.message?.content || ''
-  try {
-    const cleaned = content.replace(/```json\n?|```/g, '').trim()
-    const parsed = JSON.parse(cleaned)
-    return {
-      analysis: parsed.analysis || content,
-      sentiment: (['BULLISH', 'BEARISH', 'NEUTRAL'].includes(parsed.sentiment) ? parsed.sentiment : 'NEUTRAL') as 'BULLISH' | 'BEARISH' | 'NEUTRAL',
-      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 50,
-      keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints : [content.slice(0, 100)]
-    }
-  } catch {
-    return { analysis: content, sentiment: 'NEUTRAL', confidence: 50, keyPoints: [content.slice(0, 100)] }
+  if (!content) {
+    return { analysis: 'No response from AI model. Check API key and model availability.', sentiment: 'NEUTRAL', confidence: 0, keyPoints: ['No response received'] }
   }
+  // Parse natural language response
+  let sentiment: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL'
+  let confidence = 50
+  const keyPoints: string[] = []
+  
+  const sentimentMatch = content.match(/SENTIMENT:\s*(BULLISH|BEARISH|NEUTRAL)/i)
+  if (sentimentMatch) sentiment = sentimentMatch[1].toUpperCase() as 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+  else if (/bullish|upward|strong buy|positive momentum/i.test(content)) sentiment = 'BULLISH'
+  else if (/bearish|downward|strong sell|negative momentum/i.test(content)) sentiment = 'BEARISH'
+  
+  const confMatch = content.match(/CONFIDENCE:\s*(\d+)/i)
+  if (confMatch) confidence = Math.min(100, Math.max(0, parseInt(confMatch[1])))
+  else if (backtestResult.result === 'WIN' && backtestResult.pips > 50) confidence = 75
+  else if (backtestResult.result === 'LOSS') confidence = 30
+  
+  const keyPointMatches = content.match(/^-\s+(.+)$/gm)
+  if (keyPointMatches) {
+    keyPointMatches.forEach(kp => keyPoints.push(kp.replace(/^-\s+/, '').trim()))
+  }
+  if (keyPoints.length === 0) {
+    const sentences = content.split(/[.!?]+/).filter(s => s.trim().length > 10).slice(0, 3)
+    sentences.forEach(s => keyPoints.push(s.trim()))
+  }
+  
+  return { analysis: content, sentiment, confidence, keyPoints: keyPoints.slice(0, 5) }
 }
 
 // =============================================
@@ -1131,8 +1189,8 @@ function App() {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'meta-llama/llama-3.1-8b-instruct:free',
-              messages: [{ role: 'system', content: 'You are a gold trading signal analyst. Analyze decision-making patterns, message timing, signal quality, and risk management. Respond in JSON format.' }, { role: 'user', content: prompt }],
+          model: 'openrouter/quasar-alpha',
+              messages: [{ role: 'system', content: 'You are a professional gold (XAUUSD) trading signal analyst. Provide detailed analysis of decision-making patterns, message timing, signal quality, risk-reward ratios, and risk management. Be thorough and actionable in your response.' }, { role: 'user', content: prompt }],
               max_tokens: 800
         })
       })
@@ -1172,9 +1230,9 @@ function App() {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'meta-llama/llama-3.1-8b-instruct:free',
+          model: 'openrouter/quasar-alpha',
           messages: [
-            { role: 'system', content: `You are a gold (XAUUSD) trading signal analysis assistant. You have access to the following data:\n\nRecent Signals:\n${signalSummary}\n\nStats: ${statsContext}\n\nHelp the user analyze trading patterns, signal quality, risk management, and market conditions. Be concise and actionable.` },
+            { role: 'system', content: `You are a professional gold (XAUUSD) trading signal analysis assistant. You have access to live trading data:\n\nRecent Signals:\n${signalSummary}\n\nStats: ${statsContext}\n\nHelp the user analyze trading patterns, signal quality, risk management, and market conditions. Be thorough, specific with numbers, and actionable. Reference specific signals and data points in your answers.` },
             ...chatMessages.filter(m => m.role !== 'system').slice(-10).map(m => ({ role: m.role, content: m.content })),
             { role: 'user', content: userMsg }
           ],
@@ -1206,7 +1264,8 @@ function App() {
   const totalSignals = signals.length
   const wins = backtestResults.filter(r => r.result === 'WIN').length
   const losses = backtestResults.filter(r => r.result === 'LOSS').length
-  const winRate = totalSignals > 0 ? ((wins / totalSignals) * 100).toFixed(1) : '0'
+  const resolvedSignals = wins + losses
+  const winRate = resolvedSignals > 0 ? ((wins / resolvedSignals) * 100).toFixed(1) : '0'
   const totalPips = backtestResults.reduce((sum, r) => sum + r.pips, 0)
   const totalPnl = backtestResults.reduce((sum, r) => sum + r.pnlUsd, 0)
   const avgPips = totalSignals > 0 ? Math.round(totalPips / totalSignals) : 0
@@ -1575,17 +1634,27 @@ function App() {
                         {selectedAI.sentiment}
                       </span>
                       <span className="text-[9px] text-gray-500">Confidence: {selectedAI.confidence}%</span>
-                      <div className="flex-1 bg-gray-800 rounded-full h-1">
-                        <div className={`h-1 rounded-full ${selectedAI.confidence > 70 ? 'bg-green-500' : selectedAI.confidence > 40 ? 'bg-yellow-500' : 'bg-red-500'}`}
+                      <div className="flex-1 bg-gray-800 rounded-full h-1.5">
+                        <div className={`h-1.5 rounded-full transition-all ${selectedAI.confidence > 70 ? 'bg-green-500' : selectedAI.confidence > 40 ? 'bg-yellow-500' : 'bg-red-500'}`}
                           style={{ width: `${selectedAI.confidence}%` }} />
                       </div>
                     </div>
-                    <div className="text-[10px] text-gray-300 leading-relaxed">{selectedAI.analysis}</div>
+                    {selectedSignal && (
+                      <div className="bg-gray-900/50 rounded p-1 text-[8px] text-gray-500 flex flex-wrap gap-x-3 gap-y-0.5">
+                        <span>{selectedSignal.direction} @ {selectedSignal.entryLow}-{selectedSignal.entryHigh}</span>
+                        <span>SL: {selectedSignal.stopLoss || 'N/A'}</span>
+                        <span>TPs: {selectedSignal.takeProfits.length > 0 ? selectedSignal.takeProfits.join(', ') : 'None'}</span>
+                        <span>TP Hits: {selectedSignal.tpHits.length > 0 ? selectedSignal.tpHits.join(', ') : 'None'}</span>
+                        <span>Status: {selectedSignal.status}</span>
+                      </div>
+                    )}
+                    <div className="text-[9px] text-gray-300 leading-relaxed whitespace-pre-wrap bg-gray-900/30 rounded p-1.5 max-h-[120px] overflow-y-auto border border-gray-800/30">{selectedAI.analysis}</div>
                     {selectedAI.keyPoints.length > 0 && (
                       <div className="space-y-0.5">
+                        <div className="text-[8px] text-gray-500 uppercase tracking-wider">Key Points</div>
                         {selectedAI.keyPoints.map((point, i) => (
-                          <div key={i} className="flex items-start gap-1 text-[9px] text-gray-400">
-                            <span className="text-yellow-400 mt-0.5">*</span>{point}
+                          <div key={i} className="flex items-start gap-1 text-[9px] text-gray-400 bg-gray-900/20 rounded px-1 py-0.5">
+                            <span className="text-yellow-400 mt-0.5 flex-shrink-0">&#x2022;</span><span>{point}</span>
                           </div>
                         ))}
                       </div>
@@ -1717,7 +1786,7 @@ function App() {
                   <div className="bg-gray-900/50 rounded p-1.5">
                     <div className="text-[8px] text-gray-500">Win Rate</div>
                     <div className="text-sm font-bold text-blue-400">
-                      {btSignals.length > 0 ? ((btResults.filter(r => r.result === 'WIN').length / btSignals.length) * 100).toFixed(1) : '0'}%
+                      {(() => { const w = btResults.filter(r => r.result === 'WIN').length; const l = btResults.filter(r => r.result === 'LOSS').length; return (w + l) > 0 ? ((w / (w + l)) * 100).toFixed(1) : '0' })()}%
                     </div>
                   </div>
                   <div className="bg-gray-900/50 rounded p-1.5">
@@ -1731,6 +1800,30 @@ function App() {
                     <div className={`text-lg font-bold ${btResults.reduce((s, r) => s + r.pnlUsd, 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                       ${btResults.reduce((s, r) => s + r.pnlUsd, 0).toFixed(0)}
                     </div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Partial</div>
+                    <div className="text-sm font-bold text-yellow-400">{btResults.filter(r => r.result === 'PARTIAL').length}</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Avg Duration</div>
+                    <div className="text-sm font-bold text-gray-300">{btResults.length > 0 ? Math.round(btResults.reduce((s, r) => s + r.duration, 0) / btResults.length) : 0}m</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">BUY Signals</div>
+                    <div className="text-sm font-bold text-green-400">{btSignals.filter(s => s.direction === 'BUY').length}</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">SELL Signals</div>
+                    <div className="text-sm font-bold text-red-400">{btSignals.filter(s => s.direction === 'SELL').length}</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Profit Factor</div>
+                    <div className="text-sm font-bold text-cyan-400">{(() => { const gp = btResults.filter(r => r.pips > 0).reduce((s, r) => s + r.pips, 0); const gl = Math.abs(btResults.filter(r => r.pips < 0).reduce((s, r) => s + r.pips, 0)); return gl > 0 ? (gp / gl).toFixed(2) : 'N/A' })()}</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Max DD</div>
+                    <div className="text-sm font-bold text-orange-400">{(() => { let peak = 0, dd = 0, cum = 0; btResults.forEach(r => { cum += r.pips; if (cum > peak) peak = cum; if (peak - cum > dd) dd = peak - cum }); return dd })()}p</div>
                   </div>
                 </div>
                 {/* BT signal list with detail */}
@@ -2098,7 +2191,7 @@ function App() {
                   <span className="text-[10px] font-bold text-purple-300 flex items-center gap-1">
                     <MessageSquare size={10} />AI Chat
                   </span>
-                  <span className="text-[8px] text-gray-600">meta-llama/llama-3.1-8b-instruct:free</span>
+                  <span className="text-[8px] text-gray-600">openrouter/quasar-alpha</span>
                 </div>
                 <div className="flex-1 overflow-y-auto p-1.5 space-y-1 min-h-0">
                   {chatMessages.map((msg, i) => (
