@@ -345,10 +345,6 @@ Admin @Jhollay_lal`
 // TELEGRAM CLIENT HOOK
 // =============================================
 
-const API_ID = parseInt(import.meta.env.VITE_TELEGRAM_API_ID || '25535062')
-const API_HASH = import.meta.env.VITE_TELEGRAM_API_HASH || '2fcff9d64e970d8fc14ddc256f02c06b'
-const CHANNEL_ID = import.meta.env.VITE_TELEGRAM_CHANNEL_ID || '-1001235475731'
-
 function useTelegramClient() {
   const [authStep, setAuthStep] = useState<AuthStep>('disconnected')
   const [authError, setAuthError] = useState('')
