@@ -5,7 +5,8 @@ import {
   AlertTriangle, CheckCircle2, XCircle, Activity, Eye, Trash2, RefreshCw, Send,
   Zap, ArrowUpRight, ArrowDownRight, LogIn, LogOut, Phone, Key, Lock, Loader2,
   Brain, Save, Download, Play, ChevronDown, ChevronUp, Hash, Link2, Cpu,
-  DollarSign, Percent, Timer, Radio, Database, Layers,
+  DollarSign, Percent, Timer, Radio, Database, Layers, TrendingDown,
+  Calendar, ExternalLink, FileText, Filter, RotateCcw, Wifi, WifiOff,
 } from 'lucide-react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -34,6 +35,10 @@ interface TelegramMessage {
 interface BacktestResult {
   signal: Signal; signalId: string; entryPrice: number; exitPrice: number; pips: number
   pnlUsd: number; result: 'WIN' | 'LOSS' | 'PARTIAL'; tpHitsCount: number; duration: number
+  entryTime: string; exitTime: string; verificationUrl: string
+}
+interface ChatMessage {
+  role: 'user' | 'assistant' | 'system'; content: string; timestamp: Date
 }
 interface AIAnalysis {
   signalId: string; analysis: string; loading: boolean; error?: string
@@ -147,17 +152,23 @@ function mapContextMessages(allMessages: TelegramMessage[], signals: Signal[]): 
 function generateBacktestResults(signals: Signal[]): BacktestResult[] {
   return signals.map((signal) => {
     const entry = signal.activePrice || (signal.entryLow + signal.entryHigh) / 2
+    const entryTime = signal.timestamp.toISOString()
+    const lastMsg = signal.messages[signal.messages.length - 1]
+    const firstMsg = signal.messages[0]
+    const exitTime = lastMsg ? lastMsg.timestamp.toISOString() : entryTime
+    // TradingView verification URL with signal date/time
+    const tvDate = signal.timestamp.toISOString().split('T')[0].replace(/-/g, '')
+    const verificationUrl = `https://www.tradingview.com/chart/?symbol=OANDA:XAUUSD&interval=15&date=${tvDate}`
     if (!entry || isNaN(entry)) {
       return {
         signal, signalId: signal.id, entryPrice: 0, exitPrice: 0, pips: 0, pnlUsd: 0,
-        result: 'PARTIAL' as BacktestResult['result'], tpHitsCount: 0, duration: 0
+        result: 'PARTIAL' as BacktestResult['result'], tpHitsCount: 0, duration: 0,
+        entryTime, exitTime, verificationUrl
       }
     }
     const isWin = signal.status === 'COMPLETED' || signal.status === 'TP_HIT'
     const isLoss = signal.status === 'SL_HIT'
     let exitPrice = entry, pips = 0
-    // Runner logic: TP1 hit → move to breakeven, take profit at TP1-TP2 mainly
-    // If TP1+ hit, exit at highest TP hit (runners concept: close partial at each TP)
     if (isWin && signal.tpHits.length > 0) {
       const maxTp = Math.max(...signal.tpHits)
       exitPrice = signal.takeProfits[maxTp - 1] || signal.takeProfits[signal.takeProfits.length - 1]
@@ -173,18 +184,17 @@ function generateBacktestResults(signals: Signal[]): BacktestResult[] {
       pips = signal.maxPips
       exitPrice = signal.direction === 'BUY' ? entry + pips / 10 : entry - pips / 10
     }
-    // Guard against NaN
     if (isNaN(pips)) pips = 0
     if (isNaN(exitPrice)) exitPrice = entry
     const pnlUsd = pips * LOT_SIZE * 10
-    const lastMsg = signal.messages[signal.messages.length - 1], firstMsg = signal.messages[0]
     const duration = lastMsg && firstMsg ? (lastMsg.timestamp.getTime() - firstMsg.timestamp.getTime()) / 60000 : 0
     return {
       signal, signalId: signal.id, entryPrice: Math.round(entry * 10) / 10,
       exitPrice: Math.round(exitPrice * 10) / 10,
       pips: Math.round(pips), pnlUsd: Math.round(pnlUsd * 100) / 100,
       result: (isLoss ? 'LOSS' : isWin ? 'WIN' : 'PARTIAL') as BacktestResult['result'],
-      tpHitsCount: signal.tpHits.length, duration: Math.round(duration)
+      tpHitsCount: signal.tpHits.length, duration: Math.round(duration),
+      entryTime, exitTime, verificationUrl
     }
   })
 }
@@ -207,7 +217,7 @@ async function analyzeSignalWithAI(
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'google/gemini-2.0-flash-001',
+      model: 'meta-llama/llama-3.1-8b-instruct:free',
       messages: [
         {
           role: 'system',
@@ -537,16 +547,24 @@ function SignalPriceChart({ signal, backtestResult }: { signal: Signal | null; b
     const entry = signal.activePrice || (signal.entryLow + signal.entryHigh) / 2
     const exit = backtestResult?.exitPrice || entry
     const baseTime = Math.floor(signal.timestamp.getTime() / 1000)
+    // Timeframe intervals in seconds
+    const tfIntervals: Record<string, number> = { '1m': 60, '5m': 300, '15m': 900, '1H': 3600, '4H': 14400, '1D': 86400 }
+    const interval = tfIntervals[selectedTf] || 900
+    // Adjust candle count based on timeframe for good visual coverage
+    const preBars = selectedTf === '1D' ? 15 : selectedTf === '4H' ? 20 : selectedTf === '1H' ? 30 : 40
+    const postBars = selectedTf === '1D' ? 10 : selectedTf === '4H' ? 15 : selectedTf === '1H' ? 25 : 45
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const candles: any[] = []
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const vols: any[] = []
+    // Scale volatility based on timeframe
+    const volScale = selectedTf === '1D' ? 6 : selectedTf === '4H' ? 4 : selectedTf === '1H' ? 2.5 : selectedTf === '5m' ? 0.8 : selectedTf === '1m' ? 0.4 : 1.5
     let price = entry + (Math.random() - 0.5) * 8
 
-    for (let i = -40; i < 0; i++) {
-      const t = baseTime + i * 900
+    for (let i = -preBars; i < 0; i++) {
+      const t = baseTime + i * interval
       const drift = (entry - price) * 0.015
-      const v = 1.5 + Math.random() * 3
+      const v = volScale + Math.random() * volScale * 2
       const open = price, close = open + drift + (Math.random() - 0.5) * v
       const high = Math.max(open, close) + Math.random() * v * 0.6
       const low = Math.min(open, close) - Math.random() * v * 0.6
@@ -558,13 +576,13 @@ function SignalPriceChart({ signal, backtestResult }: { signal: Signal | null; b
     candles.push({ time: baseTime, open: +(entry - 0.5).toFixed(1), high: +(signal.entryHigh + 1).toFixed(1), low: +(signal.entryLow - 1).toFixed(1), close: +entry.toFixed(1) })
     vols.push({ time: baseTime, value: 450, color: '#3b82f650' })
 
-    const totalPost = 45
+    const totalPost = postBars
     for (let i = 1; i <= totalPost; i++) {
-      const t = baseTime + i * 900
+      const t = baseTime + i * interval
       const progress = i / totalPost
       const target = entry + (exit - entry) * Math.min(progress * 1.15, 1)
       const drift = (target - price) * 0.07
-      const v = 1.2 + Math.random() * 2 * (1 - progress * 0.4)
+      const v = (volScale * 0.8) + Math.random() * volScale * (1 - progress * 0.4)
       const open = price, close = open + drift + (Math.random() - 0.5) * v
       const high = Math.max(open, close) + Math.random() * v * 0.5
       const low = Math.min(open, close) - Math.random() * v * 0.5
@@ -627,7 +645,7 @@ function SignalPriceChart({ signal, backtestResult }: { signal: Signal | null; b
       }
     })
     chart.timeScale().fitContent()
-  }, [signal, backtestResult])
+  }, [signal, backtestResult, selectedTf])
 
   const entryMid = signal ? (signal.activePrice || (signal.entryLow + signal.entryHigh) / 2) : 0
   const riskPips = signal ? Math.abs(entryMid - signal.stopLoss) * 10 : 0
@@ -912,6 +930,14 @@ function App() {
   const [liveResults, setLiveResults] = useState<BacktestResult[]>([])
   const [liveRawText, setLiveRawText] = useState('')
   const liveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const liveStartTimeRef = useRef<Date | null>(null)
+
+  // AI Chat state
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    { role: 'system', content: 'Gold Signal Tracker AI Assistant ready. Ask me about signals, trading patterns, or market analysis.', timestamp: new Date() }
+  ])
+  const [chatInput, setChatInput] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
 
   // AI tab state
   const [aiPromptTemplate, setAiPromptTemplate] = useState(
@@ -1030,26 +1056,50 @@ function App() {
     if (telegram.authStep !== 'connected' || liveRunning) return
     setLiveRunning(true)
     liveRawRef.current = ''
+    // Record the start time - only messages from NOW onwards will be processed
+    liveStartTimeRef.current = new Date()
+    setLiveMessages([]); setLiveSignals([]); setLiveResults([]); setLiveRawText('')
     const poll = async () => {
       const ch = await telegram.fetchChannelMessages(telegramChannelId, 50)
       if (ch) {
-        // Deduplicate: only add genuinely new content
-        const newLines = ch.split('\n').filter(line => !liveRawRef.current.includes(line))
-        if (newLines.length > 0) {
-          liveRawRef.current = liveRawRef.current ? liveRawRef.current + '\n' + newLines.join('\n') : newLines.join('\n')
+        // Parse all fetched messages first
+        const allFetched = parseMessages(ch)
+        // Filter: only keep messages that arrived AFTER live start time
+        const startTime = liveStartTimeRef.current?.getTime() || Date.now()
+        const newMsgs = allFetched.filter(m => m.timestamp.getTime() >= startTime)
+        if (newMsgs.length > 0) {
+          // Rebuild raw text from only new messages
+          const newLines = ch.split('\n').filter(line => {
+            if (!line.trim()) return false
+            // Check if this line's timestamp is after start time
+            const dateMatch = line.match(/\[(\d{2}\/\d{2}\/\d{4})\s+(\d{2}:\d{2})\]/)
+            if (dateMatch) {
+              const [, dateStr, timeStr] = dateMatch
+              const [day, month, year] = dateStr.split('/')
+              const lineTime = new Date(`${year}-${month}-${day}T${timeStr}:00Z`).getTime()
+              return lineTime >= startTime
+            }
+            return false
+          })
+          if (newLines.length > 0) {
+            liveRawRef.current = liveRawRef.current ? liveRawRef.current + '\n' + newLines.join('\n') : newLines.join('\n')
+          }
           const combined = liveRawRef.current
-          const msgs = parseMessages(combined)
-          const sigs = extractSignals(msgs)
-          const mapped = mapContextMessages(msgs, sigs)
-          const results = generateBacktestResults(mapped)
-          setLiveRawText(combined)
-          setLiveMessages(msgs)
-          setLiveSignals(mapped)
-          setLiveResults(results)
+          if (combined) {
+            const msgs = parseMessages(combined)
+            const sigs = extractSignals(msgs)
+            const mapped = mapContextMessages(msgs, sigs)
+            const results = generateBacktestResults(mapped)
+            setLiveRawText(combined)
+            setLiveMessages(msgs)
+            setLiveSignals(mapped)
+            setLiveResults(results)
+          }
         }
       }
     }
     poll()
+    // Auto-poll every 5 seconds continuously
     liveIntervalRef.current = setInterval(poll, 5000)
   }, [telegram, telegramChannelId, liveRunning])
 
@@ -1057,6 +1107,7 @@ function App() {
     if (liveIntervalRef.current) clearInterval(liveIntervalRef.current)
     liveIntervalRef.current = null
     setLiveRunning(false)
+    liveStartTimeRef.current = null
   }, [])
 
   useEffect(() => { return () => { if (liveIntervalRef.current) clearInterval(liveIntervalRef.current) } }, [])
@@ -1080,7 +1131,7 @@ function App() {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'google/gemini-2.0-flash-001',
+          model: 'meta-llama/llama-3.1-8b-instruct:free',
               messages: [{ role: 'system', content: 'You are a gold trading signal analyst. Analyze decision-making patterns, message timing, signal quality, and risk management. Respond in JSON format.' }, { role: 'user', content: prompt }],
               max_tokens: 800
         })
@@ -1103,6 +1154,55 @@ function App() {
     setIsProcessing(false)
   }, [signals, runAIPrompt])
 
+  // === AI CHAT HANDLER ===
+  const sendChatMessage = useCallback(async (userMsg: string) => {
+    if (!userMsg.trim() || chatLoading) return
+    const userMessage: ChatMessage = { role: 'user', content: userMsg, timestamp: new Date() }
+    setChatMessages(prev => [...prev, userMessage])
+    setChatInput('')
+    setChatLoading(true)
+    try {
+      // Build context from current signals and backtest results
+      const signalSummary = signals.slice(-10).map(s => {
+        const r = backtestResults.find(br => br.signalId === s.id)
+        return `${s.direction} ${s.entryLow}-${s.entryHigh} (${s.timestamp.toLocaleString()}) ${r ? `${r.result} ${r.pips}p $${r.pnlUsd}` : s.status}`
+      }).join('\n')
+      const statsContext = `Total: ${signals.length} signals | Wins: ${backtestResults.filter(r => r.result === 'WIN').length} | Losses: ${backtestResults.filter(r => r.result === 'LOSS').length} | Total Pips: ${backtestResults.reduce((s, r) => s + r.pips, 0)} | Total PnL: $${backtestResults.reduce((s, r) => s + r.pnlUsd, 0).toFixed(0)}`
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'meta-llama/llama-3.1-8b-instruct:free',
+          messages: [
+            { role: 'system', content: `You are a gold (XAUUSD) trading signal analysis assistant. You have access to the following data:\n\nRecent Signals:\n${signalSummary}\n\nStats: ${statsContext}\n\nHelp the user analyze trading patterns, signal quality, risk management, and market conditions. Be concise and actionable.` },
+            ...chatMessages.filter(m => m.role !== 'system').slice(-10).map(m => ({ role: m.role, content: m.content })),
+            { role: 'user', content: userMsg }
+          ],
+          max_tokens: 600
+        })
+      })
+      const data = await response.json()
+      const content = data.choices?.[0]?.message?.content || 'No response received'
+      setChatMessages(prev => [...prev, { role: 'assistant', content, timestamp: new Date() }])
+    } catch (err) {
+      setChatMessages(prev => [...prev, { role: 'assistant', content: `Error: ${err instanceof Error ? err.message : 'Failed to get response'}`, timestamp: new Date() }])
+    }
+    setChatLoading(false)
+  }, [chatLoading, signals, backtestResults, openrouterKey, chatMessages])
+
+  // === EXPORT HANDLER ===
+  const exportBacktestCSV = useCallback(() => {
+    const headers = 'Signal ID,Direction,Entry Low,Entry High,Entry Price,Exit Price,Stop Loss,Take Profits,TP Hits,Pips,PnL USD,Result,Entry Time,Exit Time,Duration (min),Verification URL\n'
+    const rows = backtestResults.map(r =>
+      `${r.signalId},${r.signal.direction},${r.signal.entryLow},${r.signal.entryHigh},${r.entryPrice},${r.exitPrice},${r.signal.stopLoss},"${r.signal.takeProfits.join(';')}",${r.tpHitsCount},${r.pips},${r.pnlUsd},${r.result},${r.entryTime},${r.exitTime},${r.duration},${r.verificationUrl}`
+    ).join('\n')
+    const blob = new Blob([headers + rows], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = `backtest_${new Date().toISOString().split('T')[0]}.csv`; a.click()
+    URL.revokeObjectURL(url)
+  }, [backtestResults])
+
   const totalSignals = signals.length
   const wins = backtestResults.filter(r => r.result === 'WIN').length
   const losses = backtestResults.filter(r => r.result === 'LOSS').length
@@ -1113,6 +1213,45 @@ function App() {
   const bestTrade = backtestResults.length > 0 ? Math.max(...backtestResults.map(r => r.pips)) : 0
   const worstTrade = backtestResults.length > 0 ? Math.min(...backtestResults.map(r => r.pips)) : 0
   const promoCount = messages.filter(m => m.type === 'PROMO').length
+
+  // Advanced analytics
+  const currentStreak = useMemo(() => {
+    let streak = 0, type = ''
+    for (let i = backtestResults.length - 1; i >= 0; i--) {
+      if (backtestResults[i].result === 'PARTIAL') continue
+      if (!type) { type = backtestResults[i].result; streak = 1 }
+      else if (backtestResults[i].result === type) streak++
+      else break
+    }
+    return { count: streak, type }
+  }, [backtestResults])
+
+  const maxDrawdown = useMemo(() => {
+    let peak = 0, maxDd = 0, cumPips = 0
+    for (const r of backtestResults) {
+      cumPips += r.pips
+      if (cumPips > peak) peak = cumPips
+      const dd = peak - cumPips
+      if (dd > maxDd) maxDd = dd
+    }
+    return maxDd
+  }, [backtestResults])
+
+  const profitFactor = useMemo(() => {
+    const grossProfit = backtestResults.filter(r => r.pips > 0).reduce((s, r) => s + r.pips, 0)
+    const grossLoss = Math.abs(backtestResults.filter(r => r.pips < 0).reduce((s, r) => s + r.pips, 0))
+    return grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : 'N/A'
+  }, [backtestResults])
+
+  const avgWinPips = useMemo(() => {
+    const winResults = backtestResults.filter(r => r.result === 'WIN')
+    return winResults.length > 0 ? Math.round(winResults.reduce((s, r) => s + r.pips, 0) / winResults.length) : 0
+  }, [backtestResults])
+
+  const avgLossPips = useMemo(() => {
+    const lossResults = backtestResults.filter(r => r.result === 'LOSS')
+    return lossResults.length > 0 ? Math.round(lossResults.reduce((s, r) => s + r.pips, 0) / lossResults.length) : 0
+  }, [backtestResults])
 
   const selectedResult = useMemo(() => selectedSignal ? backtestResults.find(r => r.signalId === selectedSignal.id) : undefined, [selectedSignal, backtestResults])
   const selectedAI = useMemo(() => selectedSignal ? aiAnalyses[selectedSignal.id] : undefined, [selectedSignal, aiAnalyses])
@@ -1163,6 +1302,11 @@ function App() {
             <span className="flex items-center gap-1 text-gray-400"><Timer size={9} />avg:{avgPips}p</span>
             <span className="text-green-400 text-[9px]">best:+{bestTrade}p</span>
             <span className="text-red-400 text-[9px]">worst:{worstTrade}p</span>
+            <span className={`text-[9px] ${currentStreak.type === 'WIN' ? 'text-green-400' : currentStreak.type === 'LOSS' ? 'text-red-400' : 'text-gray-500'}`}>
+              streak:{currentStreak.count}{currentStreak.type === 'WIN' ? 'W' : currentStreak.type === 'LOSS' ? 'L' : '-'}
+            </span>
+            <span className="text-orange-400 text-[9px]">dd:{maxDrawdown}p</span>
+            <span className="text-cyan-400 text-[9px]">pf:{profitFactor}</span>
             {promoCount > 0 && <span className="flex items-center gap-1 text-red-400"><AlertTriangle size={9} />{promoCount} flags</span>}
           </div>
           <div className="border-l border-gray-800 pl-2 flex items-center gap-2">
@@ -1178,6 +1322,9 @@ function App() {
           <div className="flex items-center gap-1">
             <button onClick={handleSaveSession} className="p-0.5 rounded hover:bg-gray-800 text-gray-400 hover:text-green-400" title="Save Session">
               {sessionSaved ? <CheckCircle2 size={12} className="text-green-400" /> : <Save size={12} />}
+            </button>
+            <button onClick={exportBacktestCSV} className="p-0.5 rounded hover:bg-gray-800 text-gray-400 hover:text-cyan-400" title="Export CSV">
+              <Download size={12} />
             </button>
             <button onClick={() => setShowSettings(v => !v)} className="p-0.5 rounded hover:bg-gray-800 text-gray-400 hover:text-white" title="Settings">
               <Settings size={12} />
@@ -1331,13 +1478,15 @@ function App() {
                     </PieChart>
                   </ResponsiveContainer>
                 </div>
-                <div className="w-1/2 space-y-1 pr-2 text-[9px]">
+                <div className="w-1/2 space-y-0.5 pr-2 text-[9px]">
                   <div className="flex justify-between"><span className="text-gray-500">Win Rate</span><span className="text-green-400 font-bold">{winRate}%</span></div>
                   <div className="flex justify-between"><span className="text-gray-500">Total Pips</span><span className="text-yellow-400 font-bold">{totalPips}</span></div>
                   <div className="flex justify-between"><span className="text-gray-500">Total PnL</span><span className={`font-bold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>${totalPnl.toFixed(0)}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-500">Avg Pips</span><span className="text-purple-400">{avgPips}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-500">Best</span><span className="text-green-400">+{bestTrade}p</span></div>
-                  <div className="flex justify-between"><span className="text-gray-500">Worst</span><span className="text-red-400">{worstTrade}p</span></div>
+                  <div className="flex justify-between"><span className="text-gray-500">Avg Win</span><span className="text-green-400">+{avgWinPips}p</span></div>
+                  <div className="flex justify-between"><span className="text-gray-500">Avg Loss</span><span className="text-red-400">{avgLossPips}p</span></div>
+                  <div className="flex justify-between"><span className="text-gray-500">Max DD</span><span className="text-orange-400">{maxDrawdown}p</span></div>
+                  <div className="flex justify-between"><span className="text-gray-500">PF</span><span className="text-cyan-400">{profitFactor}</span></div>
+                  <div className="flex justify-between"><span className="text-gray-500">Streak</span><span className={currentStreak.type === 'WIN' ? 'text-green-400' : 'text-red-400'}>{currentStreak.count}{currentStreak.type === 'WIN' ? 'W' : 'L'}</span></div>
                 </div>
               </div>
             </div>
@@ -1358,7 +1507,9 @@ function App() {
                   <th className="px-1.5 py-0.5 text-left text-gray-500 font-medium">Pips</th>
                   <th className="px-1.5 py-0.5 text-left text-gray-500 font-medium">PnL</th>
                   <th className="px-1.5 py-0.5 text-left text-gray-500 font-medium">Result</th>
+                  <th className="px-1.5 py-0.5 text-left text-gray-500 font-medium">Time</th>
                   <th className="px-1.5 py-0.5 text-left text-gray-500 font-medium">Msgs</th>
+                  <th className="px-1.5 py-0.5 text-left text-gray-500 font-medium">Verify</th>
                   <th className="px-1.5 py-0.5 text-left text-gray-500 font-medium">AI</th>
                 </tr>
               </thead>
@@ -1378,7 +1529,13 @@ function App() {
                     <td className="px-1.5 py-0.5">
                       <span className={`px-1 py-0.5 rounded text-[8px] font-bold ${r.result === 'WIN' ? 'bg-green-500/10 text-green-400' : r.result === 'LOSS' ? 'bg-red-500/10 text-red-400' : 'bg-yellow-500/10 text-yellow-400'}`}>{r.result}</span>
                     </td>
+                    <td className="px-1.5 py-0.5 text-gray-500 font-mono text-[8px]">{new Date(r.entryTime).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
                     <td className="px-1.5 py-0.5 text-gray-500">{r.signal.contextMessages?.length || r.signal.messages.length}</td>
+                    <td className="px-1.5 py-0.5">
+                      <a href={r.verificationUrl} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300" title="Verify on TradingView" onClick={e => e.stopPropagation()}>
+                        <ExternalLink size={8} />
+                      </a>
+                    </td>
                     <td className="px-1.5 py-0.5">
                       {aiAnalyses[r.signalId] ? (
                         aiAnalyses[r.signalId].loading ? <Loader2 size={8} className="animate-spin text-purple-400" /> :
@@ -1609,11 +1766,15 @@ function App() {
                           <span>|</span><span>SL:{sig.stopLoss}</span>
                           <span>|</span>{sig.takeProfits.map((tp, j) => (
                             <span key={j} className={sig.tpHits.includes(j + 1) ? 'text-green-400' : ''}>
-                              TP{j + 1}:{tp}{sig.tpHits.includes(j + 1) ? '✓' : ''}
+                              TP{j + 1}:{tp}{sig.tpHits.includes(j + 1) ? '\u2713' : ''}
                             </span>
                           ))}
-                          <span>|</span><span className={runnerStatus === 'RUNNER → BE' ? 'text-yellow-400' : runnerStatus === 'CLOSED' ? 'text-gray-500' : 'text-blue-400'}>{runnerStatus}</span>
+                          <span>|</span><span className={runnerStatus === 'RUNNER \u2192 BE' ? 'text-yellow-400' : runnerStatus === 'CLOSED' ? 'text-gray-500' : 'text-blue-400'}>{runnerStatus}</span>
                           {r && r.duration > 0 && <><span>|</span><span>{r.duration}m</span></>}
+                          {r && <><span>|</span><a href={r.verificationUrl} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 flex items-center gap-0.5" onClick={e => e.stopPropagation()}><ExternalLink size={7} />TV</a></>}
+                        </div>
+                        <div className="text-[6px] text-gray-700 mt-0.5">
+                          {sig.timestamp.toLocaleString()} → {r ? new Date(r.exitTime).toLocaleString() : '-'}
                         </div>
                       </div>
                     )
@@ -1930,6 +2091,51 @@ function App() {
                   </div>
                 </div>
               )}
+
+              {/* AI CHAT PANEL */}
+              <div className="bg-[#0d1321] rounded border border-purple-800/30 flex flex-col" style={{height: '200px'}}>
+                <div className="px-2 py-1 border-b border-purple-800/50 flex items-center justify-between flex-shrink-0 bg-purple-900/10">
+                  <span className="text-[10px] font-bold text-purple-300 flex items-center gap-1">
+                    <MessageSquare size={10} />AI Chat
+                  </span>
+                  <span className="text-[8px] text-gray-600">meta-llama/llama-3.1-8b-instruct:free</span>
+                </div>
+                <div className="flex-1 overflow-y-auto p-1.5 space-y-1 min-h-0">
+                  {chatMessages.map((msg, i) => (
+                    <div key={i} className={`text-[9px] ${msg.role === 'user' ? 'text-right' : msg.role === 'system' ? 'text-center' : 'text-left'}`}>
+                      {msg.role === 'system' ? (
+                        <span className="text-gray-600 italic">{msg.content}</span>
+                      ) : (
+                        <div className={`inline-block max-w-[85%] px-2 py-1 rounded-lg ${msg.role === 'user' ? 'bg-blue-600/20 text-blue-300 rounded-br-none' : 'bg-gray-800/50 text-gray-300 rounded-bl-none'}`}>
+                          <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                          <span className="text-[7px] text-gray-600 block mt-0.5">{msg.timestamp.toLocaleTimeString()}</span>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  {chatLoading && (
+                    <div className="flex items-center gap-1 text-purple-400 text-[9px]">
+                      <Loader2 size={10} className="animate-spin" />Thinking...
+                    </div>
+                  )}
+                </div>
+                <div className="p-1.5 border-t border-gray-800/50 flex gap-1 flex-shrink-0">
+                  <input
+                    value={chatInput}
+                    onChange={e => setChatInput(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage(chatInput) } }}
+                    placeholder="Ask about signals, patterns, risk..."
+                    className="flex-1 bg-gray-900/50 border border-gray-800 rounded px-2 py-1 text-[9px] text-gray-300 placeholder-gray-600 focus:outline-none focus:border-purple-600"
+                  />
+                  <button
+                    onClick={() => sendChatMessage(chatInput)}
+                    disabled={chatLoading || !chatInput.trim()}
+                    className="px-2 py-1 rounded bg-purple-600/30 text-purple-400 hover:bg-purple-600/40 disabled:opacity-30 text-[9px] flex items-center gap-0.5"
+                  >
+                    <Send size={8} />
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
