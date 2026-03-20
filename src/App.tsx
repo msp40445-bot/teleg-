@@ -46,6 +46,7 @@ interface SessionData {
 }
 
 type AuthStep = 'disconnected' | 'phone' | 'code' | 'password' | 'connected'
+type AppTab = 'dashboard' | 'backtest' | 'live' | 'ai'
 
 // =============================================
 // CONSTANTS
@@ -400,6 +401,42 @@ function useTelegramClient() {
     } catch (err) { console.error('Fetch error:', err); setAuthError(err instanceof Error ? err.message : 'Failed to fetch'); return '' }
   }, [authStep])
 
+  const fetchAllChannelMessages = useCallback(async (
+    channelId: string,
+    onProgress: (fetched: number, batch: string) => void,
+    onComplete: (allText: string) => void
+  ): Promise<void> => {
+    const client = clientRef.current
+    if (!client || authStep !== 'connected') return
+    try {
+      const peerChannelId = channelId.startsWith('-100') ? BigInt(channelId.slice(4)) : BigInt(channelId.replace('-', ''))
+      const entity = await client.getEntity(new Api.PeerChannel({ channelId: peerChannelId }))
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const allMessages: any[] = []
+      let offsetId = 0
+      let hasMore = true
+      while (hasMore) {
+        const result = await client.getMessages(entity, { limit: 100, offsetId })
+        const valid = result.filter((msg): msg is Api.Message => msg instanceof Api.Message && !!msg.message)
+        if (valid.length === 0) { hasMore = false; break }
+        allMessages.push(...valid)
+        offsetId = valid[valid.length - 1].id
+        const batchText = valid.reverse().map((msg) => {
+          const date = new Date(msg.date * 1000)
+          return `[${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}] GOLD SURE SIGNALS: ${msg.message}`
+        }).join('\n')
+        onProgress(allMessages.length, batchText)
+        if (result.length < 100) { hasMore = false }
+        await new Promise(r => setTimeout(r, 300))
+      }
+      const fullText = allMessages.sort((a, b) => a.date - b.date).map((msg) => {
+        const date = new Date(msg.date * 1000)
+        return `[${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}] GOLD SURE SIGNALS: ${msg.message}`
+      }).join('\n')
+      onComplete(fullText)
+    } catch (err) { console.error('Fetch all error:', err); setAuthError(err instanceof Error ? err.message : 'Failed to fetch all') }
+  }, [authStep])
+
   const tryAutoConnect = useCallback(async () => {
     const saved = localStorage.getItem('telegram_session'); if (!saved) return
     setIsLoading(true)
@@ -408,7 +445,7 @@ function useTelegramClient() {
     setIsLoading(false)
   }, [getClient])
 
-  return { authStep, authError, isLoading, userName, startAuth, submitCode, submitPassword, disconnect, fetchChannelMessages, tryAutoConnect }
+  return { authStep, authError, isLoading, userName, startAuth, submitCode, submitPassword, disconnect, fetchChannelMessages, fetchAllChannelMessages, tryAutoConnect, clientRef, getClient }
 }
 
 // =============================================
@@ -510,31 +547,21 @@ function SignalPriceChart({ signal, backtestResult }: { signal: Signal | null; b
     candleSeries.setData(candles)
     volumeSeries.setData(vols)
 
-    candleSeries.createPriceLine({ price: signal.entryLow, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `▸ Entry ${signal.entryLow}` })
-    candleSeries.createPriceLine({ price: signal.entryHigh, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `▸ Entry ${signal.entryHigh}` })
+    candleSeries.createPriceLine({ price: signal.entryLow, color: '#3b82f680', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: `Entry ${signal.entryLow}` })
+    candleSeries.createPriceLine({ price: signal.entryHigh, color: '#3b82f680', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: `Entry ${signal.entryHigh}` })
     if (signal.activePrice) {
-      candleSeries.createPriceLine({ price: signal.activePrice, color: '#60a5fa', lineWidth: 1, lineStyle: LineStyle.SparseDotted, axisLabelVisible: true, title: `Active ${signal.activePrice}` })
+      candleSeries.createPriceLine({ price: signal.activePrice, color: '#60a5fa60', lineWidth: 1, lineStyle: LineStyle.SparseDotted, axisLabelVisible: true, title: `Active ${signal.activePrice}` })
     }
-    candleSeries.createPriceLine({ price: signal.stopLoss, color: '#f6465d', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `■ SL ${signal.stopLoss}` })
+    candleSeries.createPriceLine({ price: signal.stopLoss, color: '#f6465d', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: `SL ${signal.stopLoss}` })
 
-    const tpColors = ['#0ecb81', '#34d399', '#6ee7b7', '#a7f3d0']
     signal.takeProfits.forEach((tp, i) => {
       const isHit = signal.tpHits.includes(i + 1)
       candleSeries.createPriceLine({
-        price: tp, color: isHit ? (tpColors[i] || '#0ecb81') : '#0ecb8150',
-        lineWidth: isHit ? 2 : 1, lineStyle: isHit ? LineStyle.Solid : LineStyle.Dotted,
-        axisLabelVisible: true, title: `${isHit ? '✓' : '○'} TP${i + 1} ${tp}${isHit ? ' ✓' : ''}`
+        price: tp, color: isHit ? '#0ecb81' : '#0ecb8150',
+        lineWidth: 1, lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true, title: `TP${i + 1} ${tp}${isHit ? ' ✓' : ''}`
       })
     })
-
-    if (backtestResult && backtestResult.pips !== 0) {
-      const pnlColor = backtestResult.pips > 0 ? '#0ecb81' : '#f6465d'
-      candleSeries.createPriceLine({
-        price: backtestResult.exitPrice, color: pnlColor, lineWidth: 2,
-        lineStyle: LineStyle.LargeDashed, axisLabelVisible: true,
-        title: `${signal.id} ▸ ${backtestResult.pips > 0 ? '+' : ''}${backtestResult.pips}p ($${backtestResult.pnlUsd})`
-      })
-    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const markers: any[] = [{
@@ -837,6 +864,32 @@ function App() {
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const telegram = useTelegramClient()
 
+  // Tab state
+  const [activeTab, setActiveTab] = useState<AppTab>('dashboard')
+
+  // Backtest tab state
+  const [btRunning, setBtRunning] = useState(false)
+  const [btFetched, setBtFetched] = useState(0)
+  const [btMessages, setBtMessages] = useState<TelegramMessage[]>([])
+  const [btSignals, setBtSignals] = useState<Signal[]>([])
+  const [btResults, setBtResults] = useState<BacktestResult[]>([])
+  const [btRawText, setBtRawText] = useState('')
+  const [btComplete, setBtComplete] = useState(false)
+
+  // Live trading tab state
+  const [liveRunning, setLiveRunning] = useState(false)
+  const [liveMessages, setLiveMessages] = useState<TelegramMessage[]>([])
+  const [liveSignals, setLiveSignals] = useState<Signal[]>([])
+  const [liveResults, setLiveResults] = useState<BacktestResult[]>([])
+  const [liveRawText, setLiveRawText] = useState('')
+  const liveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // AI tab state
+  const [aiPromptTemplate, setAiPromptTemplate] = useState(
+    'You are a gold trading signal analyst. Given a signal and its surrounding messages, analyze:\n1. Decision-making pattern of the signal provider\n2. Message timing and urgency\n3. Signal quality and confidence\n4. Risk management approach\n\nSignal: {signal_details}\nContext Messages ({msg_count} total):\n{messages}\n\nProvide JSON: {"sentiment":"BULLISH/BEARISH/NEUTRAL","confidence":0-100,"keyPoints":["..."],"analysis":"2-3 sentences","decisionPattern":"...","riskScore":0-100}'
+  )
+  const [aiOutputs, setAiOutputs] = useState<Record<string, { prompt: string; response: string; loading: boolean; error?: string }>>({})
+
   const processMessages = useCallback((text: string) => {
     const msgs = parseMessages(text)
     setMessages(msgs)
@@ -903,6 +956,107 @@ function App() {
     setTimeout(() => setSessionSaved(false), 2000)
   }, [rawMessages, aiAnalyses, telegramChannelId, openrouterKey])
 
+  // === BACKTEST TAB HANDLERS ===
+  const startBacktest = useCallback(async () => {
+    if (telegram.authStep !== 'connected') return
+    setBtRunning(true); setBtFetched(0); setBtMessages([]); setBtSignals([]); setBtResults([]); setBtRawText(''); setBtComplete(false)
+    let accumulated = ''
+    await telegram.fetchAllChannelMessages(
+      telegramChannelId,
+      (fetched, _batch) => {
+        setBtFetched(fetched)
+      },
+      (allText) => {
+        accumulated = allText
+        const msgs = parseMessages(allText)
+        const sigs = extractSignals(msgs)
+        const mapped = mapContextMessages(msgs, sigs)
+        const results = generateBacktestResults(mapped)
+        setBtRawText(allText)
+        setBtMessages(msgs)
+        setBtSignals(mapped)
+        setBtResults(results)
+        setBtComplete(true)
+        setBtRunning(false)
+        localStorage.setItem('bt_data_' + telegramChannelId, accumulated)
+      }
+    )
+  }, [telegram, telegramChannelId])
+
+  // === LIVE TRADING HANDLERS ===
+  const startLiveTrading = useCallback(() => {
+    if (telegram.authStep !== 'connected' || liveRunning) return
+    setLiveRunning(true)
+    const poll = async () => {
+      const ch = await telegram.fetchChannelMessages(telegramChannelId, 50)
+      if (ch) {
+        setLiveRawText(prev => {
+          const combined = prev ? prev + '\n' + ch : ch
+          const msgs = parseMessages(combined)
+          const sigs = extractSignals(msgs)
+          const mapped = mapContextMessages(msgs, sigs)
+          const results = generateBacktestResults(mapped)
+          setLiveMessages(msgs)
+          setLiveSignals(mapped)
+          setLiveResults(results)
+          return combined
+        })
+      }
+    }
+    poll()
+    liveIntervalRef.current = setInterval(poll, 5000)
+  }, [telegram, telegramChannelId, liveRunning])
+
+  const stopLiveTrading = useCallback(() => {
+    if (liveIntervalRef.current) clearInterval(liveIntervalRef.current)
+    liveIntervalRef.current = null
+    setLiveRunning(false)
+  }, [])
+
+  useEffect(() => { return () => { if (liveIntervalRef.current) clearInterval(liveIntervalRef.current) } }, [])
+
+  // === AI PROMPT HANDLERS ===
+  const runAIPrompt = useCallback(async (sig: Signal) => {
+    const result = backtestResults.find(r => r.signalId === sig.id)
+    if (!sig.contextMessages) return
+    const contextTexts = sig.contextMessages.map(m =>
+      `[${m.timestamp.toLocaleString()}] [${m.type}] ${m.text}`
+    ).join('\n')
+    const signalDetails = `${sig.id}: ${sig.direction} XAUUSD ${sig.entryLow}-${sig.entryHigh} | TPs: ${sig.takeProfits.join(', ')} | SL: ${sig.stopLoss} | Status: ${sig.status}${result ? ` | Result: ${result.result} (${result.pips}p, $${result.pnlUsd})` : ''}`
+    const prompt = aiPromptTemplate
+      .replace('{signal_details}', signalDetails)
+      .replace('{msg_count}', String(sig.contextMessages.length))
+      .replace('{messages}', contextTexts)
+
+    setAiOutputs(prev => ({ ...prev, [sig.id]: { prompt, response: '', loading: true } }))
+    try {
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'google/gemini-2.0-flash-001',
+          messages: [{ role: 'system', content: prompt.split('\n\nSignal:')[0] }, { role: 'user', content: 'Signal:' + prompt.split('\n\nSignal:').slice(1).join('\n\nSignal:') }],
+          max_tokens: 600
+        })
+      })
+      const data = await response.json()
+      const content = data.choices?.[0]?.message?.content || 'No response'
+      setAiOutputs(prev => ({ ...prev, [sig.id]: { prompt, response: content, loading: false } }))
+    } catch (err) {
+      setAiOutputs(prev => ({ ...prev, [sig.id]: { prompt, response: '', loading: false, error: err instanceof Error ? err.message : 'Failed' } }))
+    }
+  }, [backtestResults, openrouterKey, aiPromptTemplate])
+
+  const runAllAIPrompts = useCallback(async () => {
+    setIsProcessing(true); setProcessStep(0)
+    for (let i = 0; i < signals.length; i++) {
+      setProcessStep(i + 1)
+      await runAIPrompt(signals[i])
+      await new Promise(r => setTimeout(r, 500))
+    }
+    setIsProcessing(false)
+  }, [signals, runAIPrompt])
+
   const totalSignals = signals.length
   const wins = backtestResults.filter(r => r.result === 'WIN').length
   const losses = backtestResults.filter(r => r.result === 'LOSS').length
@@ -941,7 +1095,14 @@ function App() {
         <div className="flex items-center gap-2">
           <div className="bg-yellow-500 rounded p-0.5"><TrendingUp size={12} className="text-gray-900" /></div>
           <span className="font-bold text-xs text-white">Gold Signal Tracker</span>
-          <span className="text-[9px] text-gray-500">XAUUSD</span>
+          <div className="flex gap-px bg-gray-800/40 rounded p-px ml-2">
+            {([['dashboard', 'Dashboard', BarChart3], ['backtest', 'Backtest', Database], ['live', 'Live', Radio], ['ai', 'AI', Brain]] as const).map(([tab, label, Icon]) => (
+              <button key={tab} onClick={() => setActiveTab(tab as AppTab)}
+                className={`px-2 py-0.5 rounded text-[9px] flex items-center gap-1 transition-colors ${activeTab === tab ? 'bg-yellow-500/20 text-yellow-400' : 'text-gray-500 hover:text-gray-300'}`}>
+                <Icon size={9} />{label}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-3 text-[10px]">
@@ -1015,7 +1176,8 @@ function App() {
         </div>
       )}
 
-      {/* MAIN DASHBOARD GRID */}
+      {/* TAB CONTENT */}
+      {activeTab === 'dashboard' && (
       <div className="flex-1 grid grid-cols-12 gap-0.5 p-0.5 overflow-hidden min-h-0">
 
         {/* LEFT PANEL: Signal List */}
@@ -1288,6 +1450,408 @@ function App() {
           )}
         </div>
       </div>
+      )}
+
+      {/* BACKTEST TAB */}
+      {activeTab === 'backtest' && (
+        <div className="flex-1 flex flex-col overflow-hidden min-h-0 p-1 gap-1">
+          <div className="bg-[#0d1321] rounded border border-gray-800/30 p-2 flex-shrink-0">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Database size={14} className="text-cyan-400" />
+                <span className="text-sm font-bold text-white">Backtest - Full Channel Import</span>
+                <span className="text-[9px] text-gray-500 font-mono">{telegramChannelId}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                {btRunning ? (
+                  <div className="flex items-center gap-2">
+                    <Loader2 size={12} className="animate-spin text-cyan-400" />
+                    <span className="text-[10px] text-cyan-400">Fetching... {btFetched} messages</span>
+                  </div>
+                ) : (
+                  <button onClick={startBacktest} disabled={telegram.authStep !== 'connected'}
+                    className="px-3 py-1 rounded bg-cyan-600 text-white text-[10px] hover:bg-cyan-700 disabled:opacity-50 flex items-center gap-1">
+                    <Play size={10} />Start Backtest
+                  </button>
+                )}
+                {btComplete && <span className="text-[9px] text-green-400 flex items-center gap-1"><CheckCircle2 size={9} />Complete</span>}
+              </div>
+            </div>
+            {btRunning && (
+              <div className="mt-1">
+                <div className="w-full bg-gray-800 rounded-full h-1">
+                  <div className="bg-cyan-500 h-1 rounded-full transition-all animate-pulse" style={{ width: '60%' }} />
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex-1 grid grid-cols-12 gap-1 min-h-0 overflow-hidden">
+            {/* BT Stats */}
+            <div className="col-span-3 bg-[#0d1321] rounded border border-gray-800/30 flex flex-col min-h-0">
+              <div className="px-2 py-1 border-b border-gray-800/50 flex-shrink-0">
+                <span className="text-[10px] font-bold text-gray-300">Backtest Results</span>
+              </div>
+              <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                <div className="grid grid-cols-2 gap-1">
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Messages</div>
+                    <div className="text-sm font-bold text-white">{btMessages.length}</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Signals</div>
+                    <div className="text-sm font-bold text-yellow-400">{btSignals.length}</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Wins</div>
+                    <div className="text-sm font-bold text-green-400">{btResults.filter(r => r.result === 'WIN').length}</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Losses</div>
+                    <div className="text-sm font-bold text-red-400">{btResults.filter(r => r.result === 'LOSS').length}</div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Win Rate</div>
+                    <div className="text-sm font-bold text-blue-400">
+                      {btSignals.length > 0 ? ((btResults.filter(r => r.result === 'WIN').length / btSignals.length) * 100).toFixed(1) : '0'}%
+                    </div>
+                  </div>
+                  <div className="bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Total Pips</div>
+                    <div className={`text-sm font-bold ${btResults.reduce((s, r) => s + r.pips, 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {btResults.reduce((s, r) => s + r.pips, 0)}
+                    </div>
+                  </div>
+                  <div className="col-span-2 bg-gray-900/50 rounded p-1.5">
+                    <div className="text-[8px] text-gray-500">Total PnL</div>
+                    <div className={`text-lg font-bold ${btResults.reduce((s, r) => s + r.pnlUsd, 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      ${btResults.reduce((s, r) => s + r.pnlUsd, 0).toFixed(0)}
+                    </div>
+                  </div>
+                </div>
+                {/* BT signal list */}
+                <div className="text-[8px] text-gray-500 uppercase tracking-wider mt-2">Signals</div>
+                <div className="space-y-0.5">
+                  {btSignals.map((sig, i) => {
+                    const r = btResults[i]
+                    return (
+                      <div key={sig.id} className="bg-gray-900/30 rounded px-1.5 py-0.5 flex items-center justify-between text-[9px]">
+                        <div className="flex items-center gap-1">
+                          <span className={sig.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}>{sig.direction}</span>
+                          <span className="text-gray-500 font-mono">{sig.entryLow}-{sig.entryHigh}</span>
+                        </div>
+                        {r && (
+                          <div className="flex items-center gap-1">
+                            <span className={`font-mono font-bold ${r.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                              {r.pips > 0 ? '+' : ''}{r.pips}p
+                            </span>
+                            <span className={`px-0.5 rounded text-[7px] ${r.result === 'WIN' ? 'bg-green-500/10 text-green-400' : r.result === 'LOSS' ? 'bg-red-500/10 text-red-400' : 'bg-yellow-500/10 text-yellow-400'}`}>
+                              {r.result}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* BT Chart Area */}
+            <div className="col-span-9 flex flex-col min-h-0 gap-1">
+              <div className="bg-[#0d1321] rounded border border-gray-800/30 flex-1 min-h-0 p-1">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={btResults.map((r, i) => ({
+                    name: `S${i + 1}`, pips: r.pips, pnl: r.pnlUsd,
+                    fill: r.result === 'WIN' ? '#22c55e' : r.result === 'LOSS' ? '#ef4444' : '#eab308'
+                  }))} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+                    <XAxis dataKey="name" tick={{ fill: '#6b7280', fontSize: 9 }} />
+                    <YAxis tick={{ fill: '#6b7280', fontSize: 9 }} />
+                    <Tooltip contentStyle={{ backgroundColor: '#0d1321', border: '1px solid #1f2937', borderRadius: '4px', fontSize: '10px' }}
+                      formatter={(value: number) => [`${value} pips`, 'Pips']} />
+                    <Bar dataKey="pips" radius={[2, 2, 0, 0]}>
+                      {btResults.map((r, i) => <Cell key={i} fill={r.result === 'WIN' ? '#22c55e' : r.result === 'LOSS' ? '#ef4444' : '#eab308'} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="bg-[#0d1321] rounded border border-gray-800/30 flex-1 min-h-0 p-1">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={btResults.reduce((acc: { name: string; pips: number; pnl: number }[], r, i) => {
+                    const prev = acc.length > 0 ? acc[acc.length - 1] : { pips: 0, pnl: 0 }
+                    acc.push({ name: `S${i + 1}`, pips: prev.pips + r.pips, pnl: prev.pnl + r.pnlUsd })
+                    return acc
+                  }, [])} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
+                    <defs>
+                      <linearGradient id="btGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.3} />
+                        <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+                    <XAxis dataKey="name" tick={{ fill: '#6b7280', fontSize: 9 }} />
+                    <YAxis tick={{ fill: '#6b7280', fontSize: 9 }} />
+                    <Tooltip contentStyle={{ backgroundColor: '#0d1321', border: '1px solid #1f2937', borderRadius: '4px', fontSize: '10px' }}
+                      formatter={(value: number, name: string) => [name === 'pips' ? `${value} pips` : `$${value}`, name]} />
+                    <Area type="monotone" dataKey="pips" stroke="#06b6d4" strokeWidth={2} fill="url(#btGrad)" dot={{ fill: '#06b6d4', r: 2 }} />
+                    <Line type="monotone" dataKey="pnl" stroke="#eab308" strokeWidth={1} dot={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* LIVE TRADING TAB */}
+      {activeTab === 'live' && (
+        <div className="flex-1 flex flex-col overflow-hidden min-h-0 p-1 gap-1">
+          <div className="bg-[#0d1321] rounded border border-gray-800/30 p-2 flex-shrink-0">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Radio size={14} className={liveRunning ? 'text-green-400 animate-pulse' : 'text-gray-500'} />
+                <span className="text-sm font-bold text-white">Live Trading</span>
+                <span className="text-[9px] text-gray-500 font-mono">{telegramChannelId}</span>
+                {liveRunning && (
+                  <span className="flex items-center gap-1 text-[9px] text-green-400">
+                    <span className="relative flex h-1.5 w-1.5"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" /><span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" /></span>
+                    LIVE
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {liveRunning ? (
+                  <button onClick={stopLiveTrading} className="px-3 py-1 rounded bg-red-600 text-white text-[10px] hover:bg-red-700 flex items-center gap-1">
+                    <XCircle size={10} />Stop
+                  </button>
+                ) : (
+                  <button onClick={startLiveTrading} disabled={telegram.authStep !== 'connected'}
+                    className="px-3 py-1 rounded bg-green-600 text-white text-[10px] hover:bg-green-700 disabled:opacity-50 flex items-center gap-1">
+                    <Play size={10} />Start Live
+                  </button>
+                )}
+                <span className="text-[9px] text-gray-500">{liveMessages.length} msgs | {liveSignals.length} signals</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex-1 grid grid-cols-12 gap-1 min-h-0 overflow-hidden">
+            {/* Live Signal Feed */}
+            <div className="col-span-4 bg-[#0d1321] rounded border border-gray-800/30 flex flex-col min-h-0">
+              <div className="px-2 py-1 border-b border-gray-800/50 flex-shrink-0">
+                <span className="text-[10px] font-bold text-gray-300 flex items-center gap-1"><Zap size={10} className="text-yellow-400" />Active Signals</span>
+              </div>
+              <div className="flex-1 overflow-y-auto p-1 space-y-0.5 min-h-0">
+                {liveSignals.slice().reverse().map((sig, i) => {
+                  const r = liveResults.find(lr => lr.signalId === sig.id)
+                  return (
+                    <div key={sig.id} className="bg-gray-900/30 rounded p-1.5 border border-gray-800/30">
+                      <div className="flex items-center justify-between mb-0.5">
+                        <div className="flex items-center gap-1">
+                          {sig.direction === 'BUY' ? <ArrowUpRight size={10} className="text-green-400" /> : <ArrowDownRight size={10} className="text-red-400" />}
+                          <span className={`font-bold text-[10px] ${sig.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>{sig.direction}</span>
+                          <span className="text-gray-500 font-mono text-[9px]">{sig.entryLow}-{sig.entryHigh}</span>
+                        </div>
+                        <StatusBadge status={sig.status} />
+                      </div>
+                      <div className="flex items-center gap-2 text-[8px]">
+                        <span className="text-red-400/70">SL:{sig.stopLoss}</span>
+                        {sig.takeProfits.map((tp, j) => (
+                          <span key={j} className={sig.tpHits.includes(j + 1) ? 'text-green-400' : 'text-gray-600'}>TP{j + 1}:{tp}</span>
+                        ))}
+                        {r && <span className={`font-bold ${r.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>{r.pips > 0 ? '+' : ''}{r.pips}p</span>}
+                      </div>
+                      <div className="text-[7px] text-gray-600 mt-0.5">{sig.timestamp.toLocaleString()}</div>
+                    </div>
+                  )
+                })}
+                {liveSignals.length === 0 && (
+                  <div className="text-center py-8 text-gray-600 text-[10px]">
+                    <Radio size={20} className="mx-auto mb-2 opacity-20" />
+                    {liveRunning ? 'Waiting for signals...' : 'Start live to begin'}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Live Message Feed */}
+            <div className="col-span-8 bg-[#0d1321] rounded border border-gray-800/30 flex flex-col min-h-0">
+              <div className="px-2 py-1 border-b border-gray-800/50 flex-shrink-0">
+                <span className="text-[10px] font-bold text-gray-300 flex items-center gap-1"><MessageSquare size={10} className="text-blue-400" />Live Message Feed ({liveMessages.length})</span>
+              </div>
+              <div className="flex-1 overflow-y-auto min-h-0 divide-y divide-gray-800/20">
+                {liveMessages.slice().reverse().map(msg => {
+                  const typeColor: Record<string, string> = {
+                    SIGNAL: 'border-l-blue-500 bg-blue-950/10', UPDATE: 'border-l-green-500 bg-green-950/10',
+                    PROMO: 'border-l-red-500 bg-red-950/5', GREETING: 'border-l-gray-600', UNKNOWN: 'border-l-gray-800'
+                  }
+                  return (
+                    <div key={msg.id} className={`px-2 py-1 border-l-2 ${typeColor[msg.type]}`}>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[8px] text-gray-600 font-mono">{msg.timestamp.toLocaleString()}</span>
+                        <span className={`px-0.5 rounded text-[7px] ${msg.type === 'SIGNAL' ? 'bg-blue-500/20 text-blue-400' : msg.type === 'UPDATE' ? 'bg-green-500/20 text-green-400' : msg.type === 'PROMO' ? 'bg-red-500/20 text-red-400' : 'bg-gray-500/10 text-gray-500'}`}>{msg.type}</span>
+                        {msg.linkedSignalId && <span className="text-yellow-400/50 text-[7px]">[{msg.linkedSignalId}]</span>}
+                      </div>
+                      <p className="text-[9px] text-gray-400 whitespace-pre-wrap leading-tight mt-0.5">{msg.text}</p>
+                    </div>
+                  )
+                })}
+                {liveMessages.length === 0 && (
+                  <div className="text-center py-8 text-gray-600 text-[10px]">
+                    <Activity size={20} className="mx-auto mb-2 opacity-20" />
+                    {liveRunning ? 'Listening for messages...' : 'Start live trading to see messages'}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI ANALYSIS TAB */}
+      {activeTab === 'ai' && (
+        <div className="flex-1 flex flex-col overflow-hidden min-h-0 p-1 gap-1">
+          {/* Prompt Template Editor */}
+          <div className="bg-[#0d1321] rounded border border-gray-800/30 p-2 flex-shrink-0">
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                <Brain size={14} className="text-purple-400" />
+                <span className="text-sm font-bold text-white">AI Prompt Engineer</span>
+                <span className="text-[9px] text-gray-500">Bind signals to context messages and analyze decision-making</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={runAllAIPrompts} disabled={isProcessing || signals.length === 0}
+                  className="px-3 py-1 rounded bg-purple-600 text-white text-[10px] hover:bg-purple-700 disabled:opacity-50 flex items-center gap-1">
+                  {isProcessing ? <Loader2 size={10} className="animate-spin" /> : <Zap size={10} />}
+                  Analyze All ({signals.length})
+                </button>
+                {isProcessing && <span className="text-[9px] text-purple-400">{processStep}/{signals.length}</span>}
+              </div>
+            </div>
+            <textarea value={aiPromptTemplate} onChange={e => setAiPromptTemplate(e.target.value)} rows={3}
+              className="w-full bg-gray-950 border border-gray-700 rounded px-2 py-1 text-[9px] text-gray-300 font-mono focus:border-purple-500 focus:outline-none resize-y" />
+            <div className="text-[8px] text-gray-600 mt-0.5">Variables: {'{signal_details}'} {'{msg_count}'} {'{messages}'}</div>
+          </div>
+
+          {/* AI Results Grid */}
+          <div className="flex-1 grid grid-cols-12 gap-1 min-h-0 overflow-hidden">
+            {/* Signal List for AI */}
+            <div className="col-span-3 bg-[#0d1321] rounded border border-gray-800/30 flex flex-col min-h-0">
+              <div className="px-2 py-1 border-b border-gray-800/50 flex-shrink-0">
+                <span className="text-[10px] font-bold text-gray-300">Signal &rarr; Messages Binding</span>
+              </div>
+              <div className="flex-1 overflow-y-auto p-1 space-y-0.5 min-h-0">
+                {signals.map(sig => {
+                  const hasOutput = aiOutputs[sig.id]
+                  return (
+                    <div key={sig.id} onClick={() => setSelectedSignal(sig)}
+                      className={`rounded p-1.5 cursor-pointer border transition-all ${selectedSignal?.id === sig.id ? 'border-purple-500 bg-purple-500/5' : 'border-gray-800/30 bg-gray-900/30 hover:border-gray-600'}`}>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-1">
+                          <span className={`text-[10px] font-bold ${sig.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>{sig.direction}</span>
+                          <span className="text-gray-500 font-mono text-[9px]">{sig.id}</span>
+                        </div>
+                        {hasOutput ? (
+                          hasOutput.loading ? <Loader2 size={8} className="animate-spin text-purple-400" /> :
+                            <CheckCircle2 size={8} className="text-purple-400" />
+                        ) : (
+                          <button onClick={(e) => { e.stopPropagation(); runAIPrompt(sig) }}
+                            className="text-[8px] px-1 py-0.5 rounded bg-purple-600/20 text-purple-400 hover:bg-purple-600/30">
+                            Run
+                          </button>
+                        )}
+                      </div>
+                      <div className="text-[8px] text-gray-600 mt-0.5">
+                        {sig.contextMessages?.length || 0} msgs linked | {sig.takeProfits.length} TPs | SL:{sig.stopLoss}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
+            {/* AI Output Panel */}
+            <div className="col-span-9 flex flex-col min-h-0 gap-1">
+              {selectedSignal && (
+                <>
+                  {/* Context Messages for Selected Signal */}
+                  <div className="bg-[#0d1321] rounded border border-gray-800/30 flex-1 flex flex-col min-h-0">
+                    <div className="px-2 py-1 border-b border-gray-800/50 flex items-center justify-between flex-shrink-0">
+                      <span className="text-[10px] font-bold text-gray-300 flex items-center gap-1">
+                        <Link2 size={10} className="text-blue-400" />
+                        Bound Messages: {selectedSignal.id} ({selectedSignal.contextMessages?.length || 0} msgs before next signal)
+                      </span>
+                      <span className="text-[9px] text-gray-500">
+                        {selectedSignal.direction} {selectedSignal.entryLow}-{selectedSignal.entryHigh} | SL:{selectedSignal.stopLoss} | TPs:{selectedSignal.takeProfits.join(',')}
+                      </span>
+                    </div>
+                    <div className="flex-1 overflow-y-auto min-h-0 divide-y divide-gray-800/20">
+                      {selectedSignal.contextMessages?.map(msg => (
+                        <div key={msg.id} className={`px-2 py-0.5 border-l-2 ${msg.type === 'SIGNAL' ? 'border-l-blue-500 bg-blue-950/5' : msg.type === 'UPDATE' ? 'border-l-green-500 bg-green-950/5' : msg.type === 'PROMO' ? 'border-l-red-500' : 'border-l-gray-800'}`}>
+                          <div className="flex items-center gap-1">
+                            <span className="text-[7px] text-gray-600 font-mono">{msg.timestamp.toLocaleString()}</span>
+                            <span className={`px-0.5 rounded text-[6px] ${msg.type === 'SIGNAL' ? 'bg-blue-500/20 text-blue-400' : msg.type === 'UPDATE' ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/10 text-gray-500'}`}>{msg.type}</span>
+                          </div>
+                          <p className="text-[8px] text-gray-400 whitespace-pre-wrap leading-tight">{msg.text}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* AI Response */}
+                  <div className="bg-[#0d1321] rounded border border-purple-800/30 flex-1 flex flex-col min-h-0">
+                    <div className="px-2 py-1 border-b border-purple-800/50 flex items-center justify-between flex-shrink-0 bg-purple-900/10">
+                      <span className="text-[10px] font-bold text-purple-300 flex items-center gap-1">
+                        <Brain size={10} />AI Analysis Output - {selectedSignal.id}
+                      </span>
+                      <button onClick={() => runAIPrompt(selectedSignal)} disabled={aiOutputs[selectedSignal.id]?.loading}
+                        className="px-2 py-0.5 rounded bg-purple-600/20 text-purple-400 hover:bg-purple-600/30 text-[9px] flex items-center gap-0.5 disabled:opacity-50">
+                        {aiOutputs[selectedSignal.id]?.loading ? <Loader2 size={8} className="animate-spin" /> : <Zap size={8} />}
+                        {aiOutputs[selectedSignal.id] ? 'Re-run' : 'Run'}
+                      </button>
+                    </div>
+                    <div className="flex-1 overflow-y-auto p-2 min-h-0">
+                      {aiOutputs[selectedSignal.id] ? (
+                        aiOutputs[selectedSignal.id].loading ? (
+                          <div className="flex items-center gap-2 text-purple-400 text-[10px]"><Loader2 size={12} className="animate-spin" />Sending prompt with {selectedSignal.contextMessages?.length || 0} bound messages...</div>
+                        ) : aiOutputs[selectedSignal.id].error ? (
+                          <div className="text-red-400 text-[10px]">{aiOutputs[selectedSignal.id].error}</div>
+                        ) : (
+                          <div className="space-y-2">
+                            <div>
+                              <div className="text-[8px] text-purple-400/50 uppercase tracking-wider mb-0.5">Prompt Sent</div>
+                              <pre className="text-[8px] text-gray-600 bg-gray-950/50 rounded p-1.5 whitespace-pre-wrap max-h-[80px] overflow-y-auto font-mono">{aiOutputs[selectedSignal.id].prompt}</pre>
+                            </div>
+                            <div>
+                              <div className="text-[8px] text-purple-400/50 uppercase tracking-wider mb-0.5">AI Response</div>
+                              <pre className="text-[9px] text-gray-300 bg-gray-950/50 rounded p-1.5 whitespace-pre-wrap font-mono leading-relaxed">{aiOutputs[selectedSignal.id].response}</pre>
+                            </div>
+                          </div>
+                        )
+                      ) : (
+                        <div className="text-center py-6 text-gray-600 text-[10px]">
+                          <Brain size={24} className="mx-auto mb-2 opacity-20" />
+                          Click "Run" to analyze this signal with AI<br />
+                          <span className="text-[8px] text-gray-700">The prompt will include {selectedSignal.contextMessages?.length || 0} bound context messages</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+              {!selectedSignal && (
+                <div className="bg-[#0d1321] rounded border border-gray-800/30 flex-1 flex items-center justify-center">
+                  <div className="text-center text-gray-600 text-[10px]">
+                    <Brain size={24} className="mx-auto mb-2 opacity-20" />
+                    Select a signal to view bound messages and AI analysis
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
