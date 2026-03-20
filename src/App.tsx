@@ -147,20 +147,35 @@ function mapContextMessages(allMessages: TelegramMessage[], signals: Signal[]): 
 function generateBacktestResults(signals: Signal[]): BacktestResult[] {
   return signals.map((signal) => {
     const entry = signal.activePrice || (signal.entryLow + signal.entryHigh) / 2
+    if (!entry || isNaN(entry)) {
+      return {
+        signal, signalId: signal.id, entryPrice: 0, exitPrice: 0, pips: 0, pnlUsd: 0,
+        result: 'PARTIAL' as BacktestResult['result'], tpHitsCount: 0, duration: 0
+      }
+    }
     const isWin = signal.status === 'COMPLETED' || signal.status === 'TP_HIT'
     const isLoss = signal.status === 'SL_HIT'
     let exitPrice = entry, pips = 0
+    // Runner logic: TP1 hit → move to breakeven, take profit at TP1-TP2 mainly
+    // If TP1+ hit, exit at highest TP hit (runners concept: close partial at each TP)
     if (isWin && signal.tpHits.length > 0) {
       const maxTp = Math.max(...signal.tpHits)
       exitPrice = signal.takeProfits[maxTp - 1] || signal.takeProfits[signal.takeProfits.length - 1]
-      pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
+      if (exitPrice && !isNaN(exitPrice)) {
+        pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
+      }
     } else if (isLoss) {
       exitPrice = signal.stopLoss
-      pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
-    } else if (signal.maxPips) {
+      if (exitPrice && !isNaN(exitPrice)) {
+        pips = signal.direction === 'BUY' ? (exitPrice - entry) * 10 : (entry - exitPrice) * 10
+      }
+    } else if (signal.maxPips && !isNaN(signal.maxPips)) {
       pips = signal.maxPips
       exitPrice = signal.direction === 'BUY' ? entry + pips / 10 : entry - pips / 10
     }
+    // Guard against NaN
+    if (isNaN(pips)) pips = 0
+    if (isNaN(exitPrice)) exitPrice = entry
     const pnlUsd = pips * LOT_SIZE * 10
     const lastMsg = signal.messages[signal.messages.length - 1], firstMsg = signal.messages[0]
     const duration = lastMsg && firstMsg ? (lastMsg.timestamp.getTime() - firstMsg.timestamp.getTime()) / 60000 : 0
@@ -415,19 +430,33 @@ function useTelegramClient() {
       const allMessages: any[] = []
       let offsetId = 0
       let hasMore = true
+      let retryCount = 0
       while (hasMore) {
-        const result = await client.getMessages(entity, { limit: 100, offsetId })
-        const valid = result.filter((msg): msg is Api.Message => msg instanceof Api.Message && !!msg.message)
-        if (valid.length === 0) { hasMore = false; break }
-        allMessages.push(...valid)
-        offsetId = valid[valid.length - 1].id
-        const batchText = valid.reverse().map((msg) => {
-          const date = new Date(msg.date * 1000)
-          return `[${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}] GOLD SURE SIGNALS: ${msg.message}`
-        }).join('\n')
-        onProgress(allMessages.length, batchText)
-        if (result.length < 100) { hasMore = false }
-        await new Promise(r => setTimeout(r, 300))
+        try {
+          const result = await client.getMessages(entity, { limit: 100, offsetId })
+          retryCount = 0
+          const valid = result.filter((msg): msg is Api.Message => msg instanceof Api.Message && !!msg.message)
+          if (valid.length === 0) { hasMore = false; break }
+          allMessages.push(...valid)
+          offsetId = valid[valid.length - 1].id
+          const batchText = valid.reverse().map((msg) => {
+            const date = new Date(msg.date * 1000)
+            return `[${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}] GOLD SURE SIGNALS: ${msg.message}`
+          }).join('\n')
+          onProgress(allMessages.length, batchText)
+          if (result.length < 100) { hasMore = false }
+          await new Promise(r => setTimeout(r, 200))
+        } catch (floodErr) {
+          // Handle flood wait - extract wait time and retry
+          const errMsg = floodErr instanceof Error ? floodErr.message : String(floodErr)
+          const waitMatch = errMsg.match(/(\d+)\s*s/i)
+          const waitTime = waitMatch ? parseInt(waitMatch[1]) * 1000 : (retryCount + 1) * 2000
+          retryCount++
+          if (retryCount > 10) { hasMore = false; break }
+          console.log(`Flood wait: sleeping ${waitTime}ms (retry ${retryCount})`)
+          onProgress(allMessages.length, `⏳ Rate limited, waiting ${Math.ceil(waitTime / 1000)}s...`)
+          await new Promise(r => setTimeout(r, waitTime))
+        }
       }
       const fullText = allMessages.sort((a, b) => a.date - b.date).map((msg) => {
         const date = new Date(msg.date * 1000)
@@ -957,17 +986,29 @@ function App() {
   }, [rawMessages, aiAnalyses, telegramChannelId, openrouterKey])
 
   // === BACKTEST TAB HANDLERS ===
+  const btAccumulatedRef = useRef('')
   const startBacktest = useCallback(async () => {
     if (telegram.authStep !== 'connected') return
     setBtRunning(true); setBtFetched(0); setBtMessages([]); setBtSignals([]); setBtResults([]); setBtRawText(''); setBtComplete(false)
-    let accumulated = ''
+    btAccumulatedRef.current = ''
     await telegram.fetchAllChannelMessages(
       telegramChannelId,
-      (fetched, _batch) => {
+      (fetched, batch) => {
         setBtFetched(fetched)
+        // Live buildup: process incrementally as batches arrive
+        if (batch && !batch.startsWith('\u23f3')) {
+          btAccumulatedRef.current = btAccumulatedRef.current ? btAccumulatedRef.current + '\n' + batch : batch
+          const msgs = parseMessages(btAccumulatedRef.current)
+          const sigs = extractSignals(msgs)
+          const mapped = mapContextMessages(msgs, sigs)
+          const results = generateBacktestResults(mapped)
+          setBtMessages(msgs)
+          setBtSignals(mapped)
+          setBtResults(results)
+        }
       },
       (allText) => {
-        accumulated = allText
+        // Final complete parse with properly sorted data
         const msgs = parseMessages(allText)
         const sigs = extractSignals(msgs)
         const mapped = mapContextMessages(msgs, sigs)
@@ -978,7 +1019,7 @@ function App() {
         setBtResults(results)
         setBtComplete(true)
         setBtRunning(false)
-        localStorage.setItem('bt_data_' + telegramChannelId, accumulated)
+        localStorage.setItem('bt_data_' + telegramChannelId, allText)
       }
     )
   }, [telegram, telegramChannelId])
@@ -1035,8 +1076,8 @@ function App() {
         headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'google/gemini-2.0-flash-001',
-          messages: [{ role: 'system', content: prompt.split('\n\nSignal:')[0] }, { role: 'user', content: 'Signal:' + prompt.split('\n\nSignal:').slice(1).join('\n\nSignal:') }],
-          max_tokens: 600
+              messages: [{ role: 'system', content: 'You are a gold trading signal analyst. Analyze decision-making patterns, message timing, signal quality, and risk management. Respond in JSON format.' }, { role: 'user', content: prompt }],
+              max_tokens: 800
         })
       })
       const data = await response.json()
@@ -1478,10 +1519,11 @@ function App() {
               </div>
             </div>
             {btRunning && (
-              <div className="mt-1">
-                <div className="w-full bg-gray-800 rounded-full h-1">
-                  <div className="bg-cyan-500 h-1 rounded-full transition-all animate-pulse" style={{ width: '60%' }} />
+              <div className="mt-1 flex items-center gap-2">
+                <div className="flex-1 bg-gray-800 rounded-full h-1">
+                  <div className="bg-cyan-500 h-1 rounded-full transition-all" style={{ width: `${Math.min(100, btFetched / 50)}%` }} />
                 </div>
+                <span className="text-[8px] text-gray-500 font-mono">{btMessages.length} msgs → {btSignals.length} sigs | W:{btResults.filter(r => r.result === 'WIN').length} L:{btResults.filter(r => r.result === 'LOSS').length}</span>
               </div>
             )}
           </div>
@@ -1529,27 +1571,45 @@ function App() {
                     </div>
                   </div>
                 </div>
-                {/* BT signal list */}
-                <div className="text-[8px] text-gray-500 uppercase tracking-wider mt-2">Signals</div>
+                {/* BT signal list with detail */}
+                <div className="text-[8px] text-gray-500 uppercase tracking-wider mt-2 flex justify-between">
+                  <span>Signals ({btSignals.length})</span>
+                  <span>Head: {btSignals[0]?.timestamp.toLocaleDateString() || '-'} | Latest: {btSignals[btSignals.length - 1]?.timestamp.toLocaleDateString() || '-'}</span>
+                </div>
                 <div className="space-y-0.5">
                   {btSignals.map((sig, i) => {
                     const r = btResults[i]
+                    const runnerStatus = sig.tpHits.length > 0 ? (sig.tpHits.length >= 2 ? 'CLOSED' : 'RUNNER → BE') : (sig.status === 'SL_HIT' ? 'CLOSED' : 'PENDING')
                     return (
-                      <div key={sig.id} className="bg-gray-900/30 rounded px-1.5 py-0.5 flex items-center justify-between text-[9px]">
-                        <div className="flex items-center gap-1">
-                          <span className={sig.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}>{sig.direction}</span>
-                          <span className="text-gray-500 font-mono">{sig.entryLow}-{sig.entryHigh}</span>
-                        </div>
-                        {r && (
+                      <div key={sig.id} className={`bg-gray-900/30 rounded px-1.5 py-0.5 text-[8px] border-l-2 ${r?.result === 'WIN' ? 'border-l-green-500' : r?.result === 'LOSS' ? 'border-l-red-500' : 'border-l-gray-700'}`}>
+                        <div className="flex items-center justify-between">
                           <div className="flex items-center gap-1">
-                            <span className={`font-mono font-bold ${r.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                              {r.pips > 0 ? '+' : ''}{r.pips}p
-                            </span>
-                            <span className={`px-0.5 rounded text-[7px] ${r.result === 'WIN' ? 'bg-green-500/10 text-green-400' : r.result === 'LOSS' ? 'bg-red-500/10 text-red-400' : 'bg-yellow-500/10 text-yellow-400'}`}>
-                              {r.result}
-                            </span>
+                            <span className={sig.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}>{sig.direction}</span>
+                            <span className="text-gray-500 font-mono">{sig.entryLow}-{sig.entryHigh}</span>
+                            <span className="text-gray-600">{sig.timestamp.toLocaleDateString()}</span>
                           </div>
-                        )}
+                          {r && (
+                            <div className="flex items-center gap-1">
+                              <span className={`font-mono font-bold ${r.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                {r.pips > 0 ? '+' : ''}{r.pips}p
+                              </span>
+                              <span className={`px-0.5 rounded text-[7px] ${r.result === 'WIN' ? 'bg-green-500/10 text-green-400' : r.result === 'LOSS' ? 'bg-red-500/10 text-red-400' : 'bg-yellow-500/10 text-yellow-400'}`}>
+                                {r.result}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1 text-[7px] text-gray-600 mt-0.5">
+                          <span>E:{r?.entryPrice || '-'}</span><span>→</span><span>X:{r?.exitPrice || '-'}</span>
+                          <span>|</span><span>SL:{sig.stopLoss}</span>
+                          <span>|</span>{sig.takeProfits.map((tp, j) => (
+                            <span key={j} className={sig.tpHits.includes(j + 1) ? 'text-green-400' : ''}>
+                              TP{j + 1}:{tp}{sig.tpHits.includes(j + 1) ? '✓' : ''}
+                            </span>
+                          ))}
+                          <span>|</span><span className={runnerStatus === 'RUNNER → BE' ? 'text-yellow-400' : runnerStatus === 'CLOSED' ? 'text-gray-500' : 'text-blue-400'}>{runnerStatus}</span>
+                          {r && r.duration > 0 && <><span>|</span><span>{r.duration}m</span></>}
+                        </div>
                       </div>
                     )
                   })}
@@ -1849,6 +1909,38 @@ function App() {
                 </div>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* FLOATING RUNNING TASKS INDICATOR */}
+      {(btRunning || liveRunning || isProcessing) && (
+        <div className="fixed bottom-3 right-3 bg-[#0d1321] border border-gray-700 rounded-lg shadow-xl p-2 min-w-[160px] z-50">
+          <div className="text-[9px] font-bold text-gray-400 mb-1 flex items-center gap-1">
+            <Loader2 size={10} className="animate-spin text-yellow-400" />Running Tasks
+          </div>
+          <div className="space-y-0.5">
+            {btRunning && (
+              <div className="flex items-center gap-1 text-[8px]">
+                <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                <span className="text-cyan-400">Backtest</span>
+                <span className="text-gray-500 font-mono ml-auto">{btFetched} msgs</span>
+              </div>
+            )}
+            {liveRunning && (
+              <div className="flex items-center gap-1 text-[8px]">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+                <span className="text-green-400">Live Trading</span>
+                <span className="text-gray-500 font-mono ml-auto">{liveMessages.length} msgs</span>
+              </div>
+            )}
+            {isProcessing && (
+              <div className="flex items-center gap-1 text-[8px]">
+                <span className="w-1.5 h-1.5 rounded-full bg-purple-400 animate-pulse" />
+                <span className="text-purple-400">AI Analysis</span>
+                <span className="text-gray-500 font-mono ml-auto">{processStep}/{signals.length}</span>
+              </div>
+            )}
           </div>
         </div>
       )}
