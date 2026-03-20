@@ -231,9 +231,9 @@ async function analyzeSignalWithAI(
 
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://gold-signal-tracker.app', 'X-Title': 'Gold Signal Tracker' },
     body: JSON.stringify({
-      model: 'openrouter/quasar-alpha',
+      model: 'meta-llama/llama-3.3-70b-instruct:free',
       messages: [
         {
           role: 'system',
@@ -274,6 +274,9 @@ Evaluate the signal quality, entry timing, risk-reward ratio, and trader behavio
     })
   })
   const data = await response.json()
+  if (data.error) {
+    return { analysis: `API Error: ${data.error.message || JSON.stringify(data.error)}`, sentiment: 'NEUTRAL', confidence: 0, keyPoints: [`Error code: ${data.error.code || 'unknown'}`, 'Check your OpenRouter API key at openrouter.ai/settings/keys'] }
+  }
   const content = data.choices?.[0]?.message?.content || ''
   if (!content) {
     return { analysis: 'No response from AI model. Check API key and model availability.', sentiment: 'NEUTRAL', confidence: 0, keyPoints: ['No response received'] }
@@ -1187,14 +1190,15 @@ function App() {
     try {
       const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://gold-signal-tracker.app', 'X-Title': 'Gold Signal Tracker' },
         body: JSON.stringify({
-          model: 'openrouter/quasar-alpha',
+          model: 'meta-llama/llama-3.3-70b-instruct:free',
               messages: [{ role: 'system', content: 'You are a professional gold (XAUUSD) trading signal analyst. Provide detailed analysis of decision-making patterns, message timing, signal quality, risk-reward ratios, and risk management. Be thorough and actionable in your response.' }, { role: 'user', content: prompt }],
               max_tokens: 800
         })
       })
       const data = await response.json()
+      if (data.error) { throw new Error(data.error.message || JSON.stringify(data.error)) }
       const content = data.choices?.[0]?.message?.content || 'No response'
       setAiOutputs(prev => ({ ...prev, [sig.id]: { prompt, response: content, loading: false } }))
     } catch (err) {
@@ -1228,9 +1232,9 @@ function App() {
       const statsContext = `Total: ${signals.length} signals | Wins: ${backtestResults.filter(r => r.result === 'WIN').length} | Losses: ${backtestResults.filter(r => r.result === 'LOSS').length} | Total Pips: ${backtestResults.reduce((s, r) => s + r.pips, 0)} | Total PnL: $${backtestResults.reduce((s, r) => s + r.pnlUsd, 0).toFixed(0)}`
       const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${openrouterKey}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://gold-signal-tracker.app', 'X-Title': 'Gold Signal Tracker' },
         body: JSON.stringify({
-          model: 'openrouter/quasar-alpha',
+          model: 'meta-llama/llama-3.3-70b-instruct:free',
           messages: [
             { role: 'system', content: `You are a professional gold (XAUUSD) trading signal analysis assistant. You have access to live trading data:\n\nRecent Signals:\n${signalSummary}\n\nStats: ${statsContext}\n\nHelp the user analyze trading patterns, signal quality, risk management, and market conditions. Be thorough, specific with numbers, and actionable. Reference specific signals and data points in your answers.` },
             ...chatMessages.filter(m => m.role !== 'system').slice(-10).map(m => ({ role: m.role, content: m.content })),
@@ -1240,6 +1244,7 @@ function App() {
         })
       })
       const data = await response.json()
+      if (data.error) { throw new Error(data.error.message || JSON.stringify(data.error)) }
       const content = data.choices?.[0]?.message?.content || 'No response received'
       setChatMessages(prev => [...prev, { role: 'assistant', content, timestamp: new Date() }])
     } catch (err) {
@@ -2191,7 +2196,7 @@ function App() {
                   <span className="text-[10px] font-bold text-purple-300 flex items-center gap-1">
                     <MessageSquare size={10} />AI Chat
                   </span>
-                  <span className="text-[8px] text-gray-600">openrouter/quasar-alpha</span>
+                  <span className="text-[8px] text-gray-600">llama-3.3-70b (free)</span>
                 </div>
                 <div className="flex-1 overflow-y-auto p-1.5 space-y-1 min-h-0">
                   {chatMessages.map((msg, i) => (
