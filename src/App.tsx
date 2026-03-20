@@ -412,101 +412,304 @@ function useTelegramClient() {
 }
 
 // =============================================
-// CHART COMPONENT (FIXED PNL + SIGNAL ID)
+// FULL TRADINGVIEW TERMINAL CHART
 // =============================================
 
 function SignalPriceChart({ signal, backtestResult }: { signal: Signal | null; backtestResult?: BacktestResult }) {
   const chartContainerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const seriesRef = useRef<{ candle: any; volume: any } | null>(null)
+  const [ohlcv, setOhlcv] = useState<{ time: string; o: number; h: number; l: number; c: number; v: number } | null>(null)
+  const [selectedTf, setSelectedTf] = useState('15m')
 
   useEffect(() => {
     if (!chartContainerRef.current) return
     const chart = createChart(chartContainerRef.current, {
-      layout: { background: { type: ColorType.Solid, color: '#0a0e17' }, textColor: '#6b7280', fontSize: 10 },
-      grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
-      width: chartContainerRef.current.clientWidth, height: 280,
-      crosshair: { mode: 0 },
-      rightPriceScale: { borderColor: '#1f2937', scaleMargins: { top: 0.1, bottom: 0.1 } },
-      timeScale: { borderColor: '#1f2937', timeVisible: true, secondsVisible: false },
+      layout: { background: { type: ColorType.Solid, color: '#0a0e17' }, textColor: '#848e9c', fontSize: 10 },
+      grid: { vertLines: { color: '#1c233366' }, horzLines: { color: '#1c233366' } },
+      width: chartContainerRef.current.clientWidth,
+      height: chartContainerRef.current.clientHeight,
+      crosshair: {
+        mode: 0,
+        vertLine: { color: '#758696', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#2a2e39' },
+        horzLine: { color: '#758696', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#2a2e39' },
+      },
+      rightPriceScale: { borderColor: '#2a2e39', scaleMargins: { top: 0.05, bottom: 0.15 }, minimumWidth: 65 },
+      timeScale: { borderColor: '#2a2e39', timeVisible: true, secondsVisible: false, rightOffset: 5, barSpacing: 8 },
+      watermark: { visible: true, fontSize: 48, horzAlign: 'center', vertAlign: 'center', color: 'rgba(134, 152, 182, 0.03)', text: 'XAUUSD' },
     })
     chartRef.current = chart
-    const handleResize = () => { if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth }) }
-    window.addEventListener('resize', handleResize)
-    return () => { window.removeEventListener('resize', handleResize); chart.remove(); chartRef.current = null }
+    const ro = new ResizeObserver(() => {
+      if (chartContainerRef.current) {
+        chart.applyOptions({ width: chartContainerRef.current.clientWidth, height: chartContainerRef.current.clientHeight })
+      }
+    })
+    ro.observe(chartContainerRef.current)
+    return () => { ro.disconnect(); chart.remove(); chartRef.current = null }
   }, [])
 
   useEffect(() => {
     if (!chartRef.current || !signal) return
     const chart = chartRef.current
+    if (seriesRef.current) {
+      try { chart.removeSeries(seriesRef.current.candle) } catch { /* noop */ }
+      try { chart.removeSeries(seriesRef.current.volume) } catch { /* noop */ }
+      seriesRef.current = null
+    }
     const candleSeries = chart.addCandlestickSeries({
-      upColor: '#22c55e', downColor: '#ef4444', borderDownColor: '#ef4444',
-      borderUpColor: '#22c55e', wickDownColor: '#ef4444', wickUpColor: '#22c55e',
+      upColor: '#0ecb81', downColor: '#f6465d',
+      borderDownColor: '#f6465d', borderUpColor: '#0ecb81',
+      wickDownColor: '#f6465d99', wickUpColor: '#0ecb8199',
     })
+    const volumeSeries = chart.addHistogramSeries({
+      color: '#26a69a', priceFormat: { type: 'volume' }, priceScaleId: 'vol',
+    })
+    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 }, drawTicks: false })
+    seriesRef.current = { candle: candleSeries, volume: volumeSeries }
+
     const entry = signal.activePrice || (signal.entryLow + signal.entryHigh) / 2
     const exit = backtestResult?.exitPrice || entry
     const baseTime = Math.floor(signal.timestamp.getTime() / 1000)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const candleData: any[] = []
-    let price = entry
-    for (let i = -20; i < 0; i++) {
+    const candles: any[] = []
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const vols: any[] = []
+    let price = entry + (Math.random() - 0.5) * 8
+
+    for (let i = -40; i < 0; i++) {
       const t = baseTime + i * 900
-      const noise = (Math.random() - 0.5) * 4
-      const open = price + noise
-      const close = entry + (Math.random() - 0.5) * 3
-      const high = Math.max(open, close) + Math.random() * 1.5
-      const low = Math.min(open, close) - Math.random() * 1.5
-      candleData.push({ time: t, open, high, low, close })
+      const drift = (entry - price) * 0.015
+      const v = 1.5 + Math.random() * 3
+      const open = price, close = open + drift + (Math.random() - 0.5) * v
+      const high = Math.max(open, close) + Math.random() * v * 0.6
+      const low = Math.min(open, close) - Math.random() * v * 0.6
+      candles.push({ time: t, open: +open.toFixed(1), high: +high.toFixed(1), low: +low.toFixed(1), close: +close.toFixed(1) })
+      vols.push({ time: t, value: Math.floor(60 + Math.random() * 180), color: close >= open ? '#0ecb8125' : '#f6465d25' })
       price = close
     }
     price = entry
-    const totalPostCandles = 30
-    for (let i = 0; i < totalPostCandles; i++) {
+    candles.push({ time: baseTime, open: +(entry - 0.5).toFixed(1), high: +(signal.entryHigh + 1).toFixed(1), low: +(signal.entryLow - 1).toFixed(1), close: +entry.toFixed(1) })
+    vols.push({ time: baseTime, value: 450, color: '#3b82f650' })
+
+    const totalPost = 45
+    for (let i = 1; i <= totalPost; i++) {
       const t = baseTime + i * 900
-      const progress = i / totalPostCandles
-      const targetPrice = entry + (exit - entry) * progress
-      const noise = (Math.random() - 0.5) * 2.5 * (1 - progress * 0.3)
-      const open = price
-      const close = targetPrice + noise
-      const high = Math.max(open, close) + Math.random() * 1.5
-      const low = Math.min(open, close) - Math.random() * 1.5
-      candleData.push({ time: t, open, high, low, close })
+      const progress = i / totalPost
+      const target = entry + (exit - entry) * Math.min(progress * 1.15, 1)
+      const drift = (target - price) * 0.07
+      const v = 1.2 + Math.random() * 2 * (1 - progress * 0.4)
+      const open = price, close = open + drift + (Math.random() - 0.5) * v
+      const high = Math.max(open, close) + Math.random() * v * 0.5
+      const low = Math.min(open, close) - Math.random() * v * 0.5
+      candles.push({ time: t, open: +open.toFixed(1), high: +high.toFixed(1), low: +low.toFixed(1), close: +close.toFixed(1) })
+      const vol = Math.floor(80 + Math.random() * 140 + (i < 5 ? 250 : 0))
+      vols.push({ time: t, value: vol, color: close >= open ? '#0ecb8120' : '#f6465d20' })
       price = close
     }
-    candleSeries.setData(candleData)
-    candleSeries.createPriceLine({ price: signal.entryLow, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `Entry ${signal.entryLow}` })
-    candleSeries.createPriceLine({ price: signal.entryHigh, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `Entry ${signal.entryHigh}` })
-    candleSeries.createPriceLine({ price: signal.stopLoss, color: '#ef4444', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `SL ${signal.stopLoss}` })
+    candleSeries.setData(candles)
+    volumeSeries.setData(vols)
+
+    candleSeries.createPriceLine({ price: signal.entryLow, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `▸ Entry ${signal.entryLow}` })
+    candleSeries.createPriceLine({ price: signal.entryHigh, color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `▸ Entry ${signal.entryHigh}` })
+    if (signal.activePrice) {
+      candleSeries.createPriceLine({ price: signal.activePrice, color: '#60a5fa', lineWidth: 1, lineStyle: LineStyle.SparseDotted, axisLabelVisible: true, title: `Active ${signal.activePrice}` })
+    }
+    candleSeries.createPriceLine({ price: signal.stopLoss, color: '#f6465d', lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `■ SL ${signal.stopLoss}` })
+
+    const tpColors = ['#0ecb81', '#34d399', '#6ee7b7', '#a7f3d0']
     signal.takeProfits.forEach((tp, i) => {
       const isHit = signal.tpHits.includes(i + 1)
-      candleSeries.createPriceLine({ price: tp, color: isHit ? '#22c55e' : '#4ade8055', lineWidth: isHit ? 2 : 1, lineStyle: isHit ? LineStyle.Solid : LineStyle.Dotted, axisLabelVisible: true, title: `TP${i + 1} ${tp}${isHit ? ' HIT' : ''}` })
+      candleSeries.createPriceLine({
+        price: tp, color: isHit ? (tpColors[i] || '#0ecb81') : '#0ecb8150',
+        lineWidth: isHit ? 2 : 1, lineStyle: isHit ? LineStyle.Solid : LineStyle.Dotted,
+        axisLabelVisible: true, title: `${isHit ? '✓' : '○'} TP${i + 1} ${tp}${isHit ? ' ✓' : ''}`
+      })
     })
+
     if (backtestResult && backtestResult.pips !== 0) {
-      const pnlColor = backtestResult.pips > 0 ? '#22c55e' : '#ef4444'
+      const pnlColor = backtestResult.pips > 0 ? '#0ecb81' : '#f6465d'
       candleSeries.createPriceLine({
         price: backtestResult.exitPrice, color: pnlColor, lineWidth: 2,
         lineStyle: LineStyle.LargeDashed, axisLabelVisible: true,
-        title: `${signal.id} | PnL: ${backtestResult.pips > 0 ? '+' : ''}${backtestResult.pips} pips ($${backtestResult.pnlUsd})`
+        title: `${signal.id} ▸ ${backtestResult.pips > 0 ? '+' : ''}${backtestResult.pips}p ($${backtestResult.pnlUsd})`
       })
     }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const markers: any[] = [{
+      time: baseTime,
+      position: signal.direction === 'BUY' ? 'belowBar' : 'aboveBar',
+      color: signal.direction === 'BUY' ? '#0ecb81' : '#f6465d',
+      shape: signal.direction === 'BUY' ? 'arrowUp' : 'arrowDown',
+      text: `${signal.direction} @ ${entry.toFixed(1)}`
+    }]
+    signal.tpHits.forEach((tpNum, idx) => {
+      const tpTime = baseTime + (8 + idx * 10) * 900
+      markers.push({ time: tpTime, position: 'aboveBar' as const, color: '#0ecb81', shape: 'circle' as const, text: `TP${tpNum} HIT` })
+    })
+    if (signal.status === 'SL_HIT') {
+      markers.push({ time: baseTime + 25 * 900, position: 'belowBar' as const, color: '#f6465d', shape: 'square' as const, text: 'SL HIT' })
+    }
+    if (signal.status === 'COMPLETED') {
+      markers.push({ time: baseTime + (totalPost - 2) * 900, position: 'aboveBar' as const, color: '#eab308', shape: 'circle' as const, text: 'COMPLETED' })
+    }
+    markers.sort((a: { time: number }, b: { time: number }) => a.time - b.time)
+    candleSeries.setMarkers(markers)
+
+    chart.subscribeCrosshairMove((param) => {
+      if (!param.time || !param.seriesData) { setOhlcv(null); return }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const c = param.seriesData.get(candleSeries) as any
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const vol = param.seriesData.get(volumeSeries) as any
+      if (c) {
+        setOhlcv({
+          time: new Date((param.time as number) * 1000).toLocaleString(),
+          o: c.open, h: c.high, l: c.low, c: c.close, v: vol?.value || 0
+        })
+      }
+    })
     chart.timeScale().fitContent()
   }, [signal, backtestResult])
 
+  const entryMid = signal ? (signal.activePrice || (signal.entryLow + signal.entryHigh) / 2) : 0
+  const riskPips = signal ? Math.abs(entryMid - signal.stopLoss) * 10 : 0
+  const maxRewardPips = signal && signal.takeProfits.length > 0
+    ? Math.abs(signal.takeProfits[signal.takeProfits.length - 1] - entryMid) * 10 : 0
+  const rr = riskPips > 0 ? (maxRewardPips / riskPips).toFixed(2) : '0'
+
   return (
-    <div className="relative">
-      <div ref={chartContainerRef} className="w-full" />
-      {signal && (
-        <div className="absolute top-1 left-1 flex gap-1 z-10 flex-wrap">
-          <span className="bg-gray-900/80 text-yellow-400 border border-yellow-500/30 px-1.5 py-0.5 rounded text-[10px] font-mono">{signal.id}</span>
-          <span className="bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded text-[10px]">Entry</span>
-          <span className="bg-red-500/20 text-red-300 px-1.5 py-0.5 rounded text-[10px]">SL</span>
-          <span className="bg-green-500/20 text-green-300 px-1.5 py-0.5 rounded text-[10px]">TP</span>
-          {backtestResult && (
-            <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${backtestResult.pips >= 0 ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
-              PnL: {backtestResult.pips > 0 ? '+' : ''}{backtestResult.pips}p (${backtestResult.pnlUsd})
-            </span>
+    <div className="flex flex-col h-full">
+      {/* Terminal Toolbar */}
+      <div className="flex items-center justify-between px-2 py-0.5 bg-[#111827] border-b border-gray-800/50 flex-shrink-0">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5">
+            <span className="text-yellow-400 font-bold text-[11px]">XAUUSD</span>
+            <span className="text-gray-600 text-[9px]">•</span>
+            <span className="text-gray-500 text-[9px]">Gold / USD</span>
+            <span className="text-gray-600 text-[9px]">•</span>
+            <span className="text-gray-500 text-[9px]">CFD</span>
+          </div>
+          <div className="flex gap-px bg-gray-800/50 rounded p-px">
+            {['1m','5m','15m','1H','4H','1D'].map(tf => (
+              <button key={tf} onClick={() => setSelectedTf(tf)}
+                className={`px-1.5 py-0.5 rounded text-[9px] transition-colors ${selectedTf === tf ? 'bg-blue-600/80 text-white' : 'text-gray-500 hover:text-gray-300'}`}>
+                {tf}
+              </button>
+            ))}
+          </div>
+          {signal && (
+            <div className="flex items-center gap-1.5 text-[9px]">
+              <span className="text-gray-700">|</span>
+              <span className={`font-bold ${signal.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>
+                {signal.direction === 'BUY' ? '▲' : '▼'} {signal.direction}
+              </span>
+              <span className="text-gray-500 font-mono">{signal.id}</span>
+              <StatusBadge status={signal.status} />
+            </div>
           )}
         </div>
-      )}
+        <div className="flex items-center gap-2 text-[9px] font-mono">
+          {ohlcv ? (
+            <>
+              <span className="text-gray-600">{ohlcv.time}</span>
+              <span className="text-gray-500">O<span className="text-gray-300 ml-0.5">{ohlcv.o.toFixed(1)}</span></span>
+              <span className="text-gray-500">H<span className="text-green-400 ml-0.5">{ohlcv.h.toFixed(1)}</span></span>
+              <span className="text-gray-500">L<span className="text-red-400 ml-0.5">{ohlcv.l.toFixed(1)}</span></span>
+              <span className="text-gray-500">C<span className={`ml-0.5 ${ohlcv.c >= ohlcv.o ? 'text-green-400' : 'text-red-400'}`}>{ohlcv.c.toFixed(1)}</span></span>
+              <span className="text-gray-500">Vol<span className="text-purple-400 ml-0.5">{ohlcv.v}</span></span>
+            </>
+          ) : (
+            <span className="text-gray-600">Hover chart for OHLCV</span>
+          )}
+        </div>
+      </div>
+
+      {/* Chart + Order Levels Panel */}
+      <div className="flex flex-1 min-h-0">
+        <div ref={chartContainerRef} className="flex-1 min-h-0" />
+        {signal && (
+          <div className="w-[130px] bg-[#0d1117] border-l border-gray-800/50 flex-shrink-0 overflow-y-auto text-[9px]">
+            <div className="p-1.5 border-b border-gray-800/30 bg-[#111827]">
+              <div className="text-[8px] text-gray-600 uppercase tracking-wider mb-0.5">Trade Setup</div>
+              <div className="flex items-center gap-1">
+                <span className={`font-bold ${signal.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>{signal.direction}</span>
+                <span className="text-yellow-400 font-mono">{signal.id}</span>
+              </div>
+            </div>
+            <div className="p-1.5 border-b border-gray-800/30">
+              <div className="text-[8px] text-blue-400/70 uppercase tracking-wider mb-0.5">Entry Zone</div>
+              <div className="bg-blue-500/10 border border-blue-500/15 rounded p-1 space-y-0.5">
+                <div className="flex justify-between"><span className="text-gray-500">High</span><span className="text-blue-400 font-mono">{signal.entryHigh}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Low</span><span className="text-blue-400 font-mono">{signal.entryLow}</span></div>
+                {signal.activePrice && (
+                  <div className="flex justify-between border-t border-blue-500/10 pt-0.5">
+                    <span className="text-gray-500">Active</span><span className="text-white font-mono font-bold">{signal.activePrice}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="p-1.5 border-b border-gray-800/30">
+              <div className="text-[8px] text-green-400/70 uppercase tracking-wider mb-0.5">Take Profits</div>
+              <div className="space-y-0.5">
+                {signal.takeProfits.map((tp, i) => {
+                  const isHit = signal.tpHits.includes(i + 1)
+                  const pipsToTp = Math.abs(tp - entryMid) * 10
+                  return (
+                    <div key={i} className={`flex items-center justify-between rounded px-1 py-0.5 ${isHit ? 'bg-green-500/10 border border-green-500/20' : 'bg-gray-800/20'}`}>
+                      <span className={isHit ? 'text-green-400 font-bold' : 'text-gray-500'}>{isHit ? '✓' : '○'}TP{i + 1}</span>
+                      <div className="text-right">
+                        <div className={`font-mono ${isHit ? 'text-green-400' : 'text-gray-400'}`}>{tp}</div>
+                        <div className="text-[7px] text-gray-600">{pipsToTp.toFixed(0)}p</div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+            <div className="p-1.5 border-b border-gray-800/30">
+              <div className="text-[8px] text-red-400/70 uppercase tracking-wider mb-0.5">Stop Loss</div>
+              <div className="bg-red-500/10 border border-red-500/20 rounded p-1">
+                <div className="flex justify-between"><span className="text-red-400 font-bold">■ SL</span><span className="text-red-400 font-mono">{signal.stopLoss}</span></div>
+                <div className="text-[7px] text-gray-600">{riskPips.toFixed(0)}p risk</div>
+              </div>
+            </div>
+            <div className="p-1.5">
+              <div className="text-[8px] text-gray-500 uppercase tracking-wider mb-0.5">Metrics</div>
+              <div className="space-y-0.5">
+                <div className="flex justify-between"><span className="text-gray-600">R:R</span><span className="text-yellow-400 font-mono">{rr}</span></div>
+                <div className="flex justify-between"><span className="text-gray-600">TPs</span><span className="text-green-400">{signal.tpHits.length}/{signal.takeProfits.length}</span></div>
+                {backtestResult && (
+                  <>
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">Pips</span>
+                      <span className={`font-mono font-bold ${backtestResult.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {backtestResult.pips > 0 ? '+' : ''}{backtestResult.pips}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">PnL</span>
+                      <span className={`font-mono font-bold ${backtestResult.pnlUsd >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        ${backtestResult.pnlUsd}
+                      </span>
+                    </div>
+                    <div className="flex justify-between"><span className="text-gray-600">Dur</span><span className="text-gray-400 font-mono">{backtestResult.duration}m</span></div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">Result</span>
+                      <span className={`font-bold ${backtestResult.result === 'WIN' ? 'text-green-400' : backtestResult.result === 'LOSS' ? 'text-red-400' : 'text-yellow-400'}`}>
+                        {backtestResult.result}
+                      </span>
+                    </div>
+                  </>
+                )}
+                <div className="flex justify-between"><span className="text-gray-600">Msgs</span><span className="text-gray-400">{signal.contextMessages?.length || signal.messages.length}</span></div>
+                <div className="flex justify-between"><span className="text-gray-600">Time</span><span className="text-gray-500 font-mono text-[7px]">{signal.timestamp.toLocaleString()}</span></div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -848,22 +1051,7 @@ function App() {
 
         {/* CENTER: Chart + Backtest */}
         <div className={`${showMessages ? 'col-span-6' : 'col-span-7'} flex flex-col min-h-0 gap-0.5`}>
-          <div className="bg-[#0d1321] rounded border border-gray-800/30 flex-shrink-0">
-            <div className="px-1.5 py-0.5 border-b border-gray-800/50 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-bold text-gray-300 flex items-center gap-1"><BarChart3 size={10} className="text-yellow-400" />Chart</span>
-                {selectedSignal && (
-                  <span className="text-[9px] text-gray-500">
-                    {selectedSignal.id} | {selectedSignal.direction} {selectedSignal.entryLow}-{selectedSignal.entryHigh}
-                  </span>
-                )}
-              </div>
-              {selectedSignal && selectedResult && (
-                <span className={`text-[10px] font-bold font-mono ${selectedResult.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  PnL: {selectedResult.pips > 0 ? '+' : ''}{selectedResult.pips}p (${selectedResult.pnlUsd})
-                </span>
-              )}
-            </div>
+          <div className="bg-[#0d1321] rounded border border-gray-800/30 flex-[2] min-h-0">
             <SignalPriceChart signal={selectedSignal} backtestResult={selectedResult} />
           </div>
 
