@@ -1,19 +1,20 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import './App.css'
 import {
-  TrendingUp, Target, ShieldAlert, Clock, BarChart3, MessageSquare, Settings,
-  AlertTriangle, CheckCircle2, XCircle, Activity, Eye, Trash2, RefreshCw, Send,
+  TrendingUp, Clock, BarChart3, MessageSquare, Settings,
+  AlertTriangle, CheckCircle2, XCircle, Activity, RefreshCw, Send,
   Zap, ArrowUpRight, ArrowDownRight, LogIn, LogOut, Phone, Key, Lock, Loader2,
-  Brain, Save, Download, Play, ChevronDown, ChevronUp, Hash, Link2, Cpu,
-  DollarSign, Percent, Timer, Radio, Database, Layers, TrendingDown,
-  Calendar, ExternalLink, FileText, Filter, RotateCcw, Wifi, WifiOff,
+  Brain, Save, Download, Play, Link2, Cpu,
+  DollarSign, Percent, Timer, Radio, Database, Layers,
+  ExternalLink, Search, Users, Plus, Minus, Globe,
 } from 'lucide-react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell, LineChart, Line, AreaChart, Area,
+  PieChart, Pie, Cell, Line, AreaChart, Area,
 } from 'recharts'
 import { TelegramClient, Api } from 'telegram'
 import { StringSession } from 'telegram/sessions'
+import bigInt from 'big-integer'
 import { createChart, ColorType, type IChartApi, LineStyle } from 'lightweight-charts'
 
 // =============================================
@@ -26,6 +27,20 @@ interface Signal {
   status: 'PENDING' | 'ACTIVE' | 'TP_HIT' | 'SL_HIT' | 'COMPLETED'
   activePrice?: number; tpHits: number[]; maxPips?: number; messages: TelegramMessage[]
   contextMessages?: TelegramMessage[]
+  sourceChannel?: string
+}
+
+interface DiscoveredChannel {
+  id: string
+  title: string
+  username: string
+  subscriberCount: number
+  description: string
+  isJoined: boolean
+  isActive: boolean
+  signalCount: number
+  lastMessage?: string
+  photo?: string
 }
 interface TelegramMessage {
   id: string; timestamp: Date; sender: string; text: string
@@ -51,7 +66,7 @@ interface SessionData {
 }
 
 type AuthStep = 'disconnected' | 'phone' | 'code' | 'password' | 'connected'
-type AppTab = 'dashboard' | 'backtest' | 'live' | 'ai'
+type AppTab = 'dashboard' | 'backtest' | 'live' | 'ai' | 'channels'
 
 // =============================================
 // CONSTANTS
@@ -91,37 +106,45 @@ function parseMessages(rawText: string): TelegramMessage[] {
 
 function classifyMessage(text: string): TelegramMessage['type'] {
   if (/GOLD\s+(Buy|Sell)\s+\d+/i.test(text)) return 'SIGNAL'
-  if (/TP\s*\d+\s*HIT|Active|Running profit|SL hit|Target Complete|Mission/i.test(text)) return 'UPDATE'
+  if (/(?:#?XAUUSD|GOLD)\s*(?:Buy|Sell)\s*[\d/]/i.test(text)) return 'SIGNAL'
+  if (/TP\s*\d+\s*HIT|Active|Running profit|SL hit|Target Complete|Mission|PIPS\s*(?:DONE|Running)|RECOVERY\s*DONE|BOOK\s*YOUR\s*PROFIT/i.test(text)) return 'UPDATE'
   if (/Contact|recover|login|MT4|MT5|@\w+/i.test(text)) return 'PROMO'
   if (/Hi Everyone|Ready for/i.test(text)) return 'GREETING'
   return 'UNKNOWN'
 }
 
-function extractSignals(messages: TelegramMessage[]): Signal[] {
+function extractSignals(messages: TelegramMessage[], sourceChannel?: string): Signal[] {
   const signals: Signal[] = []
   let current: Signal | null = null
   for (const msg of messages) {
+    // Match original format: GOLD Buy/Sell XXXX-XXXX
     const signalMatch = msg.text.match(/GOLD\s+(Buy|Sell)\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/i)
-    if (signalMatch) {
+    // Match XAUUSD format: XAUUSD Sell 5023/5026 or XAUUSD Buy 4711/4714 or #XAUUSD Sell
+    const xauMatch = !signalMatch ? msg.text.match(/(?:#?XAUUSD)\s+(Buy|Sell)\s+(\d+(?:\.\d+)?)\s*[/\u002D]\s*(\d+(?:\.\d+)?)/i) : null
+    const matched = signalMatch || xauMatch
+    if (matched) {
       if (current) signals.push(current)
-      const direction = signalMatch[1].toUpperCase() as 'BUY' | 'SELL'
-      const p1 = parseFloat(signalMatch[2]), p2 = parseFloat(signalMatch[3])
+      const direction = matched[1].toUpperCase() as 'BUY' | 'SELL'
+      const p1 = parseFloat(matched[2]), p2 = parseFloat(matched[3])
       const tps: number[] = []
-      const tpMatches = msg.text.matchAll(/TP\s+(\d+(?:\.\d+)?)/gi)
+      // Match TP formats: "TP 5010", "TP1. 5019", "TP1 5019"
+      const tpMatches = msg.text.matchAll(/TP\s*\d*\.?\s*(\d+(?:\.\d+)?)/gi)
       for (const tp of tpMatches) tps.push(parseFloat(tp[1]))
       const slMatch = msg.text.match(/SL\s+(\d+(?:\.\d+)?)/i)
-      current = { id: `signal-${signals.length}`, timestamp: msg.timestamp, direction, entryLow: Math.min(p1, p2), entryHigh: Math.max(p1, p2), takeProfits: tps, stopLoss: slMatch ? parseFloat(slMatch[1]) : 0, status: 'PENDING', tpHits: [], messages: [msg] }
+      current = { id: `signal-${signals.length}`, timestamp: msg.timestamp, direction, entryLow: Math.min(p1, p2), entryHigh: Math.max(p1, p2), takeProfits: tps, stopLoss: slMatch ? parseFloat(slMatch[1]) : 0, status: 'PENDING', tpHits: [], messages: [msg], sourceChannel }
       continue
     }
     if (!current) continue
     const activeMatch = msg.text.match(/Active\s*(?:already\s+)?(\d+(?:\.\d+)?)/i)
     if (activeMatch) { current.activePrice = parseFloat(activeMatch[1]); current.status = 'ACTIVE'; current.messages.push(msg); continue }
-    const tpHitMatch = msg.text.match(/TP\s*(\d+)\s*HIT/i)
+    // Match TP hit: "TP 1 HIT" or "TARGET 3 COMPLETE"
+    const tpHitMatch = msg.text.match(/TP\s*(\d+)\s*HIT/i) || msg.text.match(/TARGET\s*[^\d]*(\d+)\s*COMPLETE/i)
     if (tpHitMatch) { const n = parseInt(tpHitMatch[1]); if (!current.tpHits.includes(n)) current.tpHits.push(n); current.status = 'TP_HIT'; current.messages.push(msg); continue }
     if (/SL\s*hit/i.test(msg.text)) { current.status = 'SL_HIT'; current.messages.push(msg); continue }
-    const pipsMatch = msg.text.match(/(\d+)\+?\s*Pips\s*(Running|profit)/i)
+    // Match pips: "110+ PIPS DONE" or "RUNNING PROFIT 130+ PIPS" or "70+ Pips Running profit"
+    const pipsMatch = msg.text.match(/(\d+)\+?\s*Pips?\s*(?:Running|profit|DONE)/i) || msg.text.match(/(?:RUNNING\s*PROFIT|PROFIT)\s*(\d+)\+?\s*Pips?/i)
     if (pipsMatch) { current.maxPips = Math.max(current.maxPips || 0, parseInt(pipsMatch[1])); current.messages.push(msg); continue }
-    if (/All Target Complete|Mission Accomplished/i.test(msg.text)) { current.status = 'COMPLETED'; current.messages.push(msg) }
+    if (/All\s*Target\s*Complete|Mission\s*Accomplished|RECOVERY\s*DONE/i.test(msg.text)) { current.status = 'COMPLETED'; current.messages.push(msg) }
   }
   if (current) signals.push(current)
   return signals
@@ -416,7 +439,7 @@ function useTelegramClient() {
     const client = clientRef.current
     if (!client || authStep !== 'connected') return ''
     try {
-      const peerChannelId = channelId.startsWith('-100') ? BigInt(channelId.slice(4)) : BigInt(channelId.replace('-', ''))
+      const peerChannelId = channelId.startsWith('-100') ? bigInt(channelId.slice(4)) : bigInt(channelId.replace('-', ''))
       const entity = await client.getEntity(new Api.PeerChannel({ channelId: peerChannelId }))
       const result = await client.getMessages(entity, { limit })
       return result.filter((msg): msg is Api.Message => msg instanceof Api.Message && !!msg.message).reverse().map((msg) => {
@@ -434,7 +457,7 @@ function useTelegramClient() {
     const client = clientRef.current
     if (!client || authStep !== 'connected') return
     try {
-      const peerChannelId = channelId.startsWith('-100') ? BigInt(channelId.slice(4)) : BigInt(channelId.replace('-', ''))
+      const peerChannelId = channelId.startsWith('-100') ? bigInt(channelId.slice(4)) : bigInt(channelId.replace('-', ''))
       const entity = await client.getEntity(new Api.PeerChannel({ channelId: peerChannelId }))
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const allMessages: any[] = []
@@ -484,7 +507,103 @@ function useTelegramClient() {
     setIsLoading(false)
   }, [getClient])
 
-  return { authStep, authError, isLoading, userName, startAuth, submitCode, submitPassword, disconnect, fetchChannelMessages, fetchAllChannelMessages, tryAutoConnect, clientRef, getClient }
+  const discoverSimilarChannels = useCallback(async (channelId: string): Promise<DiscoveredChannel[]> => {
+    const client = clientRef.current
+    if (!client || authStep !== 'connected') return []
+    try {
+      const peerChannelId = channelId.startsWith('-100') ? bigInt(channelId.slice(4)) : bigInt(channelId.replace('-', ''))
+      const entity = await client.getEntity(new Api.PeerChannel({ channelId: peerChannelId }))
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await client.invoke(new Api.channels.GetChannelRecommendations({ channel: entity as any }))
+      const channels: DiscoveredChannel[] = []
+      if (result && 'chats' in result) {
+        for (const chat of result.chats) {
+          if (chat instanceof Api.Channel) {
+            channels.push({
+              id: `-100${chat.id}`,
+              title: chat.title || '',
+              username: chat.username || '',
+              subscriberCount: chat.participantsCount || 0,
+              description: '',
+              isJoined: false,
+              isActive: false,
+              signalCount: 0,
+            })
+          }
+        }
+      }
+      // Try to get full info for each to check join status
+      for (const ch of channels) {
+        try {
+          const chPeerId = bigInt(ch.id.startsWith('-100') ? ch.id.slice(4) : ch.id.replace('-', ''))
+          const chEntity = await client.getEntity(new Api.PeerChannel({ channelId: chPeerId }))
+          if (chEntity instanceof Api.Channel) {
+            ch.isJoined = !chEntity.left
+            ch.subscriberCount = chEntity.participantsCount || ch.subscriberCount
+          }
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const fullInfo = await client.invoke(new Api.channels.GetFullChannel({ channel: chEntity as any }))
+          if (fullInfo && fullInfo.fullChat instanceof Api.ChannelFull) {
+            ch.description = fullInfo.fullChat.about || ''
+          }
+        } catch { /* skip if can't get info */ }
+        await new Promise(r => setTimeout(r, 100))
+      }
+      return channels
+    } catch (err) {
+      console.error('Discover error:', err)
+      setAuthError(err instanceof Error ? err.message : 'Failed to discover channels')
+      return []
+    }
+  }, [authStep])
+
+  const joinChannel = useCallback(async (channelId: string): Promise<boolean> => {
+    const client = clientRef.current
+    if (!client || authStep !== 'connected') return false
+    try {
+      const peerChannelId = channelId.startsWith('-100') ? bigInt(channelId.slice(4)) : bigInt(channelId.replace('-', ''))
+      const entity = await client.getEntity(new Api.PeerChannel({ channelId: peerChannelId }))
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await client.invoke(new Api.channels.JoinChannel({ channel: entity as any }))
+      return true
+    } catch (err) {
+      console.error('Join error:', err)
+      setAuthError(err instanceof Error ? err.message : 'Failed to join channel')
+      return false
+    }
+  }, [authStep])
+
+  const leaveChannel = useCallback(async (channelId: string): Promise<boolean> => {
+    const client = clientRef.current
+    if (!client || authStep !== 'connected') return false
+    try {
+      const peerChannelId = channelId.startsWith('-100') ? bigInt(channelId.slice(4)) : bigInt(channelId.replace('-', ''))
+      const entity = await client.getEntity(new Api.PeerChannel({ channelId: peerChannelId }))
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await client.invoke(new Api.channels.LeaveChannel({ channel: entity as any }))
+      return true
+    } catch (err) {
+      console.error('Leave error:', err)
+      setAuthError(err instanceof Error ? err.message : 'Failed to leave channel')
+      return false
+    }
+  }, [authStep])
+
+  const fetchChannelMessagesWithName = useCallback(async (channelId: string, channelName: string, limit = 100): Promise<string> => {
+    const client = clientRef.current
+    if (!client || authStep !== 'connected') return ''
+    try {
+      const peerChannelId = channelId.startsWith('-100') ? bigInt(channelId.slice(4)) : bigInt(channelId.replace('-', ''))
+      const entity = await client.getEntity(new Api.PeerChannel({ channelId: peerChannelId }))
+      const result = await client.getMessages(entity, { limit })
+      return result.filter((msg): msg is Api.Message => msg instanceof Api.Message && !!msg.message).reverse().map((msg) => {
+        const date = new Date(msg.date * 1000)
+        return `[${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}] ${channelName}: ${msg.message}`
+      }).join('\n')
+    } catch (err) { console.error('Fetch error:', err); return '' }
+  }, [authStep])
+
+  return { authStep, authError, isLoading, userName, startAuth, submitCode, submitPassword, disconnect, fetchChannelMessages, fetchAllChannelMessages, tryAutoConnect, clientRef, getClient, discoverSimilarChannels, joinChannel, leaveChannel, fetchChannelMessagesWithName }
 }
 
 // =============================================
@@ -541,7 +660,7 @@ function SignalPriceChart({ signal, backtestResult }: { signal: Signal | null; b
     const volumeSeries = chart.addHistogramSeries({
       color: '#26a69a', priceFormat: { type: 'volume' }, priceScaleId: 'vol',
     })
-    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 }, drawTicks: false })
+    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } })
     seriesRef.current = { candle: candleSeries, volume: volumeSeries }
 
     const entry = signal.activePrice || (signal.entryLow + signal.entryHigh) / 2
@@ -920,7 +1039,7 @@ function App() {
   const [btMessages, setBtMessages] = useState<TelegramMessage[]>([])
   const [btSignals, setBtSignals] = useState<Signal[]>([])
   const [btResults, setBtResults] = useState<BacktestResult[]>([])
-  const [btRawText, setBtRawText] = useState('')
+  const [, setBtRawText] = useState('')
   const [btComplete, setBtComplete] = useState(false)
 
   // Live trading tab state
@@ -928,9 +1047,16 @@ function App() {
   const [liveMessages, setLiveMessages] = useState<TelegramMessage[]>([])
   const [liveSignals, setLiveSignals] = useState<Signal[]>([])
   const [liveResults, setLiveResults] = useState<BacktestResult[]>([])
-  const [liveRawText, setLiveRawText] = useState('')
+  const [, setLiveRawText] = useState('')
   const liveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const liveStartTimeRef = useRef<Date | null>(null)
+
+  // Channels tab state
+  const [discoveredChannels, setDiscoveredChannels] = useState<DiscoveredChannel[]>([])
+  const [isDiscovering, setIsDiscovering] = useState(false)
+  const [channelFilter, setChannelFilter] = useState('')
+  const [channelSignals, setChannelSignals] = useState<Record<string, { signals: Signal[]; messages: TelegramMessage[]; results: BacktestResult[]; loading: boolean; rawText: string }>>({})
+  const [activeChannelId, setActiveChannelId] = useState<string | null>(null)
 
   // AI Chat state
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -1191,6 +1317,104 @@ function App() {
   }, [chatLoading, signals, backtestResults, openrouterKey, chatMessages])
 
   // === EXPORT HANDLER ===
+  // === CHANNEL DISCOVERY HANDLERS ===
+  const handleDiscoverChannels = useCallback(async () => {
+    if (telegram.authStep !== 'connected') return
+    setIsDiscovering(true)
+    try {
+      const channels = await telegram.discoverSimilarChannels(telegramChannelId)
+      setDiscoveredChannels(channels)
+      // Save to localStorage
+      localStorage.setItem('discovered_channels', JSON.stringify(channels))
+    } catch (err) {
+      console.error('Discovery error:', err)
+    }
+    setIsDiscovering(false)
+  }, [telegram, telegramChannelId])
+
+  const handleJoinChannel = useCallback(async (channelId: string) => {
+    const success = await telegram.joinChannel(channelId)
+    if (success) {
+      setDiscoveredChannels(prev => prev.map(ch => ch.id === channelId ? { ...ch, isJoined: true } : ch))
+    }
+  }, [telegram])
+
+  const handleLeaveChannel = useCallback(async (channelId: string) => {
+    const success = await telegram.leaveChannel(channelId)
+    if (success) {
+      setDiscoveredChannels(prev => prev.map(ch => ch.id === channelId ? { ...ch, isJoined: false, isActive: false } : ch))
+      setChannelSignals(prev => { const next = { ...prev }; delete next[channelId]; return next })
+    }
+  }, [telegram])
+
+  const handleToggleChannelActive = useCallback((channelId: string) => {
+    setDiscoveredChannels(prev => prev.map(ch => ch.id === channelId ? { ...ch, isActive: !ch.isActive } : ch))
+  }, [])
+
+  const handleFetchChannelSignals = useCallback(async (channel: DiscoveredChannel) => {
+    if (telegram.authStep !== 'connected' || !channel.isJoined) return
+    setChannelSignals(prev => ({ ...prev, [channel.id]: { signals: [], messages: [], results: [], loading: true, rawText: '' } }))
+    setActiveChannelId(channel.id)
+    try {
+      const rawText = await telegram.fetchChannelMessagesWithName(channel.id, channel.title, 200)
+      if (rawText) {
+        const msgs = parseMessages(rawText)
+        const sigs = extractSignals(msgs, channel.title)
+        const mapped = mapContextMessages(msgs, sigs)
+        const results = generateBacktestResults(mapped)
+        setChannelSignals(prev => ({ ...prev, [channel.id]: { signals: mapped, messages: msgs, results, loading: false, rawText } }))
+        setDiscoveredChannels(prev => prev.map(ch => ch.id === channel.id ? { ...ch, signalCount: sigs.length } : ch))
+      } else {
+        setChannelSignals(prev => ({ ...prev, [channel.id]: { signals: [], messages: [], results: [], loading: false, rawText: '' } }))
+      }
+    } catch (err) {
+      console.error('Fetch channel signals error:', err)
+      setChannelSignals(prev => ({ ...prev, [channel.id]: { signals: [], messages: [], results: [], loading: false, rawText: '' } }))
+    }
+  }, [telegram])
+
+  const handleFetchAllActiveChannels = useCallback(async () => {
+    const activeChannels = discoveredChannels.filter(ch => ch.isActive && ch.isJoined)
+    for (const ch of activeChannels) {
+      await handleFetchChannelSignals(ch)
+      await new Promise(r => setTimeout(r, 500))
+    }
+  }, [discoveredChannels, handleFetchChannelSignals])
+
+  // Load saved discovered channels on mount
+  useEffect(() => {
+    const saved = localStorage.getItem('discovered_channels')
+    if (saved) {
+      try { setDiscoveredChannels(JSON.parse(saved)) } catch { /* ignore */ }
+    }
+  }, [])
+
+  const filteredChannels = useMemo(() => {
+    if (!channelFilter) return discoveredChannels
+    const lower = channelFilter.toLowerCase()
+    return discoveredChannels.filter(ch =>
+      ch.title.toLowerCase().includes(lower) ||
+      ch.username.toLowerCase().includes(lower) ||
+      ch.description.toLowerCase().includes(lower)
+    )
+  }, [discoveredChannels, channelFilter])
+
+  const activeChannelData = useMemo(() => {
+    if (!activeChannelId) return null
+    return channelSignals[activeChannelId] || null
+  }, [activeChannelId, channelSignals])
+
+  const allChannelSignals = useMemo(() => {
+    const allSigs: Signal[] = []
+    const allResults: BacktestResult[] = []
+    for (const [, data] of Object.entries(channelSignals)) {
+      allSigs.push(...data.signals)
+      allResults.push(...data.results)
+    }
+    return { signals: allSigs, results: allResults }
+  }, [channelSignals])
+
+  // === EXPORT HANDLER ===
   const exportBacktestCSV = useCallback(() => {
     const headers = 'Signal ID,Direction,Entry Low,Entry High,Entry Price,Exit Price,Stop Loss,Take Profits,TP Hits,Pips,PnL USD,Result,Entry Time,Exit Time,Duration (min),Verification URL\n'
     const rows = backtestResults.map(r =>
@@ -1281,7 +1505,7 @@ function App() {
           <div className="bg-yellow-500 rounded p-0.5"><TrendingUp size={12} className="text-gray-900" /></div>
           <span className="font-bold text-xs text-white">Gold Signal Tracker</span>
           <div className="flex gap-px bg-gray-800/40 rounded p-px ml-2">
-            {([['dashboard', 'Dashboard', BarChart3], ['backtest', 'Backtest', Database], ['live', 'Live', Radio], ['ai', 'AI', Brain]] as const).map(([tab, label, Icon]) => (
+            {([['dashboard', 'Dashboard', BarChart3], ['backtest', 'Backtest', Database], ['live', 'Live', Radio], ['ai', 'AI', Brain], ['channels', 'Channels', Globe]] as const).map(([tab, label, Icon]) => (
               <button key={tab} onClick={() => setActiveTab(tab as AppTab)}
                 className={`px-2 py-0.5 rounded text-[9px] flex items-center gap-1 transition-colors ${activeTab === tab ? 'bg-yellow-500/20 text-yellow-400' : 'text-gray-500 hover:text-gray-300'}`}>
                 <Icon size={9} />{label}
@@ -2135,6 +2359,168 @@ function App() {
                     <Send size={8} />
                   </button>
                 </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CHANNELS TAB */}
+      {activeTab === 'channels' && (
+        <div className="flex-1 flex flex-col overflow-hidden min-h-0 p-1 gap-1">
+          {/* Channel Discovery Header */}
+          <div className="bg-[#0d1321] rounded border border-gray-800/30 p-2 flex-shrink-0">
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                <Globe size={14} className="text-yellow-400" />
+                <span className="text-sm font-bold text-white">Channel Discovery & Management</span>
+                <span className="text-[9px] text-gray-500">{discoveredChannels.length} channels found | {discoveredChannels.filter(c => c.isJoined).length} joined | {discoveredChannels.filter(c => c.isActive).length} active</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={handleFetchAllActiveChannels}
+                  disabled={discoveredChannels.filter(c => c.isActive && c.isJoined).length === 0}
+                  className="px-3 py-1 rounded bg-green-600 text-white text-[10px] hover:bg-green-700 disabled:opacity-50 flex items-center gap-1">
+                  <Play size={10} />Run All Active ({discoveredChannels.filter(c => c.isActive && c.isJoined).length})
+                </button>
+                <button onClick={handleDiscoverChannels} disabled={isDiscovering || telegram.authStep !== 'connected'}
+                  className="px-3 py-1 rounded bg-yellow-600 text-white text-[10px] hover:bg-yellow-700 disabled:opacity-50 flex items-center gap-1">
+                  {isDiscovering ? <Loader2 size={10} className="animate-spin" /> : <Search size={10} />}
+                  {isDiscovering ? 'Discovering...' : 'Discover Similar Channels'}
+                </button>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <input value={channelFilter} onChange={e => setChannelFilter(e.target.value)}
+                placeholder="Filter channels by name, username, or description..."
+                className="flex-1 bg-gray-950 border border-gray-700 rounded px-2 py-1 text-[10px] text-gray-300 placeholder-gray-600 focus:outline-none focus:border-yellow-500" />
+            </div>
+          </div>
+
+          <div className="flex-1 grid grid-cols-12 gap-1 min-h-0 overflow-hidden">
+            {/* Channel List */}
+            <div className="col-span-5 bg-[#0d1321] rounded border border-gray-800/30 flex flex-col min-h-0">
+              <div className="px-2 py-1 border-b border-gray-800/50 flex-shrink-0 flex items-center justify-between">
+                <span className="text-[10px] font-bold text-gray-300 flex items-center gap-1"><Users size={10} className="text-yellow-400" />Channels ({filteredChannels.length})</span>
+                <div className="flex items-center gap-1 text-[8px]">
+                  <span className="text-green-400">{discoveredChannels.filter(c => c.isJoined).length} joined</span>
+                  <span className="text-yellow-400">{discoveredChannels.filter(c => c.isActive).length} active</span>
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto p-1 space-y-0.5 min-h-0">
+                {filteredChannels.map(ch => (
+                  <div key={ch.id}
+                    onClick={() => { if (ch.isJoined) { setActiveChannelId(ch.id); handleFetchChannelSignals(ch) } }}
+                    className={`bg-gray-900/30 rounded p-1.5 border-l-2 cursor-pointer hover:bg-gray-800/30 transition-colors ${
+                      activeChannelId === ch.id ? 'border-l-yellow-500 bg-yellow-500/5' :
+                      ch.isActive ? 'border-l-green-500' :
+                      ch.isJoined ? 'border-l-blue-500' : 'border-l-gray-700'
+                    }`}>
+                    <div className="flex items-center justify-between mb-0.5">
+                      <div className="flex items-center gap-1 flex-1 min-w-0">
+                        <span className="font-bold text-[10px] text-white truncate">{ch.title}</span>
+                        {ch.username && <span className="text-[8px] text-gray-500">@{ch.username}</span>}
+                      </div>
+                      <div className="flex items-center gap-1 flex-shrink-0">
+                        {ch.isJoined ? (
+                          <>
+                            <button onClick={e => { e.stopPropagation(); handleToggleChannelActive(ch.id) }}
+                              className={`px-1 py-0.5 rounded text-[7px] ${ch.isActive ? 'bg-green-500/20 text-green-400 hover:bg-green-500/30' : 'bg-gray-500/20 text-gray-400 hover:bg-gray-500/30'}`}>
+                              {ch.isActive ? 'Active' : 'Inactive'}
+                            </button>
+                            <button onClick={e => { e.stopPropagation(); handleLeaveChannel(ch.id) }}
+                              className="px-1 py-0.5 rounded text-[7px] bg-red-500/20 text-red-400 hover:bg-red-500/30 flex items-center gap-0.5">
+                              <Minus size={7} />Leave
+                            </button>
+                          </>
+                        ) : (
+                          <button onClick={e => { e.stopPropagation(); handleJoinChannel(ch.id) }}
+                            className="px-1 py-0.5 rounded text-[7px] bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 flex items-center gap-0.5">
+                            <Plus size={7} />Join
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 text-[7px] text-gray-600">
+                      <span><Users size={7} className="inline" /> {ch.subscriberCount.toLocaleString()}</span>
+                      {ch.signalCount > 0 && <span className="text-yellow-400">{ch.signalCount} signals</span>}
+                      {channelSignals[ch.id]?.loading && <Loader2 size={7} className="animate-spin text-yellow-400" />}
+                    </div>
+                    {ch.description && <p className="text-[7px] text-gray-600 mt-0.5 line-clamp-1">{ch.description}</p>}
+                  </div>
+                ))}
+                {filteredChannels.length === 0 && (
+                  <div className="text-center py-8 text-gray-600 text-[10px]">
+                    <Globe size={20} className="mx-auto mb-2 opacity-20" />
+                    {telegram.authStep !== 'connected' ? 'Connect Telegram first' :
+                     discoveredChannels.length === 0 ? 'Click "Discover Similar Channels" to find gold signal channels' :
+                     'No channels match your filter'}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Channel Signals View */}
+            <div className="col-span-7 bg-[#0d1321] rounded border border-gray-800/30 flex flex-col min-h-0">
+              <div className="px-2 py-1 border-b border-gray-800/50 flex-shrink-0 flex items-center justify-between">
+                <span className="text-[10px] font-bold text-gray-300 flex items-center gap-1">
+                  <Zap size={10} className="text-yellow-400" />
+                  {activeChannelId ? `Signals - ${discoveredChannels.find(c => c.id === activeChannelId)?.title || 'Unknown'}` : 'All Channel Signals'}
+                </span>
+                <div className="flex items-center gap-2 text-[8px]">
+                  <button onClick={() => setActiveChannelId(null)}
+                    className={`px-1 py-0.5 rounded ${!activeChannelId ? 'bg-yellow-500/20 text-yellow-400' : 'text-gray-500 hover:text-gray-300'}`}>
+                    All ({allChannelSignals.signals.length})
+                  </button>
+                  {activeChannelData && (
+                    <span className="text-gray-500">
+                      {activeChannelData.signals.length} signals | {activeChannelData.messages.length} msgs |
+                      W:{activeChannelData.results.filter(r => r.result === 'WIN').length} L:{activeChannelData.results.filter(r => r.result === 'LOSS').length}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto p-1 space-y-0.5 min-h-0">
+                {(activeChannelData ? activeChannelData.signals : allChannelSignals.signals).map(sig => {
+                  const results = activeChannelData ? activeChannelData.results : allChannelSignals.results
+                  const r = results.find(lr => lr.signalId === sig.id)
+                  return (
+                    <div key={sig.id} className={`bg-gray-900/30 rounded p-1.5 border-l-2 ${
+                      r?.result === 'WIN' ? 'border-l-green-500' : r?.result === 'LOSS' ? 'border-l-red-500' : 'border-l-gray-700'
+                    }`}>
+                      <div className="flex items-center justify-between mb-0.5">
+                        <div className="flex items-center gap-1">
+                          {sig.direction === 'BUY' ? <ArrowUpRight size={10} className="text-green-400" /> : <ArrowDownRight size={10} className="text-red-400" />}
+                          <span className={`font-bold text-[10px] ${sig.direction === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>{sig.direction}</span>
+                          <span className="text-gray-500 font-mono text-[8px]">{sig.entryLow}-{sig.entryHigh}</span>
+                          {sig.sourceChannel && <span className="text-[7px] text-yellow-400/60 bg-yellow-500/10 px-1 rounded">{sig.sourceChannel}</span>}
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <StatusBadge status={sig.status} />
+                          {r && <span className={`font-mono font-bold text-[9px] ${r.pips >= 0 ? 'text-green-400' : 'text-red-400'}`}>{r.pips > 0 ? '+' : ''}{r.pips}p | ${r.pnlUsd > 0 ? '+' : ''}{r.pnlUsd.toFixed(0)}</span>}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 text-[7px] text-gray-600">
+                        <span className="text-red-400/60">SL:{sig.stopLoss}</span>
+                        {sig.takeProfits.map((tp, j) => (
+                          <span key={j} className={sig.tpHits.includes(j + 1) ? 'text-green-400' : ''}>TP{j + 1}:{tp}{sig.tpHits.includes(j + 1) ? '\u2713' : ''}</span>
+                        ))}
+                        <span className="ml-auto">{sig.timestamp.toLocaleString()}</span>
+                      </div>
+                    </div>
+                  )
+                })}
+                {(!activeChannelData && allChannelSignals.signals.length === 0) && (
+                  <div className="text-center py-8 text-gray-600 text-[10px]">
+                    <Search size={20} className="mx-auto mb-2 opacity-20" />
+                    Select a joined channel to view its signals<br />
+                    <span className="text-[8px] text-gray-700">Or click "Run All Active" to fetch signals from all active channels</span>
+                  </div>
+                )}
+                {activeChannelData?.loading && (
+                  <div className="flex items-center justify-center gap-2 py-8 text-yellow-400 text-[10px]">
+                    <Loader2 size={14} className="animate-spin" />Fetching signals from channel...
+                  </div>
+                )}
               </div>
             </div>
           </div>
